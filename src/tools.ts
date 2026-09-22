@@ -1,63 +1,23 @@
 /**
- * 六个面向模型的数据库工具：sql_list / sql_query / sql_exec / sql_schema / sql_stats / sql_health。
+ * 数据库操作工具：sql_query / sql_exec / sql_schema / sql_stats / sql_health。
+ *
+ * 设置每次调用现读，工具体内一律走 `loadConfig()`，不留配置副本。
  *
  * @module dsh-sql/tools
  */
 import { createAdapter, type DatabaseAdapter } from './adapters.js'
-import { type ResolvedSqlConfig } from './config.js'
+import { type ResolvedSqlSettings, type SqlConnectionConfig } from './config.js'
+import {
+  asRecord,
+  compileParameters,
+  executionSignal,
+  optionalString,
+  requiredString,
+  type ContentBlock,
+  type SqlToolDefinition,
+} from './tool-kit.js'
 
-/** 模型可见的内容块。 */
-export interface ContentBlock {
-  type: 'text'
-  text: string
-}
-
-/** 注册给 ctx.tools.register 的原始工具定义。 */
-export interface SqlToolDefinition {
-  name: string
-  description: string
-  parameters: { type: 'object'; properties: Record<string, unknown>; required?: string[] }
-  output: {
-    schema: Record<string, unknown>
-    render(args: unknown, value: unknown): ContentBlock[]
-  }
-  execute(args: unknown, exec: unknown): Promise<unknown>
-  timeoutMs?: number
-}
-
-function compileParameters(spec: Record<string, any>): { type: 'object'; properties: Record<string, unknown>; required?: string[] } {
-  const properties: Record<string, unknown> = {}
-  const required: string[] = []
-  for (const [key, prop] of Object.entries(spec)) {
-    if (prop?.required === true) required.push(key)
-    const node: Record<string, unknown> = {}
-    if (typeof prop?.type === 'string') node.type = prop.type
-    if (typeof prop?.description === 'string') node.description = prop.description
-    properties[key] = node
-  }
-  return { type: 'object', properties, ...(required.length > 0 ? { required } : {}) }
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
-}
-
-function optionalString(args: Record<string, unknown>, key: string): string | undefined {
-  const value = args[key]
-  return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
-}
-
-function requiredString(args: Record<string, unknown>, key: string, label: string): string {
-  const value = optionalString(args, key)
-  if (value === undefined) throw new Error(label + '（参数 ' + key + '）为必填，请提供非空字符串。')
-  return value
-}
-
-function executionSignal(exec: unknown): AbortSignal | undefined {
-  if (typeof exec !== 'object' || exec === null) return undefined
-  const signal = (exec as { signal?: unknown }).signal
-  return signal instanceof AbortSignal ? signal : undefined
-}
+export type { ContentBlock, SqlToolDefinition } from './tool-kit.js'
 
 /** 只读语句关键字白名单。 */
 const READ_KEYWORDS = /^(select|pragma|explain|show|describe|desc|with)\b/i
@@ -188,21 +148,6 @@ const execSchema = {
   additionalProperties: true,
 }
 
-const listSchema = {
-  type: 'object',
-  properties: {
-    connections: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: { name: { type: 'string' }, engine: { type: 'string' }, host: { type: 'string' }, database: { type: 'string' }, file: { type: 'string' }, ok: { type: 'boolean' }, error: { type: 'string' } },
-        additionalProperties: true,
-      },
-    },
-  },
-  additionalProperties: true,
-}
-
 const schemaToolSchema = {
   type: 'object',
   properties: {
@@ -279,56 +224,91 @@ const healthSchema = {
   type: 'object',
   properties: {
     ok: { type: 'boolean' },
-    plugin: { type: 'string' },
-    connections: { type: 'array', items: { type: 'object', additionalProperties: true } },
-    readOnly: { type: 'boolean' },
-    writeApproval: { type: 'boolean' },
-    maxRows: { type: 'integer' },
-    queryTimeoutMs: { type: 'integer' },
-    execTimeoutMs: { type: 'integer' },
+    connections: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { name: { type: 'string' }, ok: { type: 'boolean' }, error: { type: 'string' } },
+        additionalProperties: true,
+      },
+    },
   },
   additionalProperties: true,
 }
 
-/** 审批执行上下文的最小面。 */
-export interface SqlExecGateContext {
-  agent?: unknown
-  name?: unknown
-  callId?: unknown
-  signal?: unknown
+/** 适配器缓存项：适配器 + 建它时用的连接定义指纹。 */
+interface CachedAdapter {
+  adapter: DatabaseAdapter
+  fingerprint: string
 }
 
-/** 构建六个工具定义；adapters 惰性创建并按连接名缓存。 */
-export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefinition[]; adapters: Map<string, DatabaseAdapter> } {
-  const cfg = config
+/** 连接定义指纹：任一影响连接身份的字段变了，缓存就必须失效。 */
+function connectionFingerprint(connection: SqlConnectionConfig): string {
+  return [
+    connection.engine,
+    connection.host,
+    connection.port,
+    connection.user,
+    connection.password,
+    connection.database,
+    connection.file,
+  ].join('\u0000')
+}
+
+/** 构建工具定义；设置**每次调用现读**，adapters 按连接名缓存并按指纹失效。 */
+export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: SqlToolDefinition[]; adapters: Map<string, DatabaseAdapter> } {
+  /**
+   * 适配器缓存：按连接名缓存，但每次比对指纹。
+   *
+   * 不比指纹就会静默出错：连接定义改了（host / 密码 / 库），缓存里还是老池，
+   * 查询继续打向老库且不报错。所以是「对不上就重建」，不是「没有才建」。
+   */
+  const cache = new Map<string, CachedAdapter>()
+
+  /** 对外暴露的适配器视图（供 dispose 关闭）。 */
   const adapters = new Map<string, DatabaseAdapter>()
 
-  const getAdapter = (name: string | undefined): { adapter: DatabaseAdapter; name: string } => {
-    const target = name ?? cfg.connections[0].name
-    const connection = cfg.connections.find((item) => item.name.toLowerCase() === target.toLowerCase())
+  /** 解析连接名 → 连接定义（不建适配器）。 */
+  const resolveConnection = (name: string | undefined): SqlConnectionConfig => {
+    if (name === undefined) {
+      throw new Error('必须显式指定 connection 参数（不再有默认连接）。可用 sql_settings 查看连接清单。')
+    }
+    const cfg = loadConfig()
+    const connection = cfg.connections.find((item) => item.name.toLowerCase() === name.toLowerCase())
     if (connection === undefined) {
-      throw new Error('未找到名为 ' + target + ' 的数据库连接。可用 sql_list 查看连接清单。')
+      throw new Error('未找到名为 ' + name + ' 的数据库连接。可用 sql_settings 查看连接清单。')
     }
-    let adapter = adapters.get(connection.name)
-    if (adapter === undefined) {
-      adapter = createAdapter(connection)
-      adapters.set(connection.name, adapter)
-    }
-    return { adapter, name: connection.name }
+    return connection
   }
 
+  /** 连接定义 → 适配器（惰性创建；定义变了则关掉旧的、重建）。 */
+  const adapterFor = (connection: SqlConnectionConfig): DatabaseAdapter => {
+    const fingerprint = connectionFingerprint(connection)
+    const cached = cache.get(connection.name)
+    if (cached !== undefined) {
+      if (cached.fingerprint === fingerprint) return cached.adapter
+      // 定义变了：旧池不再代表这个连接，关掉它再建新的。
+      // 失败不影响新池可用（旧连接可能已经断了），所以不 await、只报不抛。
+      void cached.adapter.close().catch(() => {})
+    }
+    const adapter = createAdapter(connection)
+    cache.set(connection.name, { adapter, fingerprint })
+    adapters.set(connection.name, adapter)
+    return adapter
+  }
+
+  const getAdapter = (name: string | undefined): { adapter: DatabaseAdapter; name: string; connection: SqlConnectionConfig } => {
+    const connection = resolveConnection(name)
+    return { adapter: adapterFor(connection), name: connection.name, connection }
+  }
+
+  /** 逐连接并发探活：串行下 N 个不通要等 N 次超时，并发只等最慢的一个。 */
   const pingAllConnections = async (signal?: AbortSignal): Promise<Array<Record<string, unknown>>> => {
-    const rows: Array<Record<string, unknown>> = []
-    for (const connection of cfg.connections) {
-      const entry: Record<string, unknown> = { name: connection.name, engine: connection.engine }
-      if (connection.engine === 'sqlite') entry.file = connection.file ?? ':memory:'
-      else {
-        entry.host = connection.host ?? ''
-        entry.database = connection.database ?? ''
-      }
+    const cfg = loadConfig()
+    return await Promise.all(cfg.connections.map(async (connection) => {
+      const entry: Record<string, unknown> = { name: connection.name }
       try {
-        const { adapter } = getAdapter(connection.name)
-        await adapter.ping(signal)
+        await adapterFor(connection).ping(signal)
         entry.ok = true
         entry.error = ''
       } catch (error) {
@@ -336,41 +316,16 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
         entry.ok = false
         entry.error = error instanceof Error ? error.message : String(error)
       }
-      rows.push(entry)
-    }
-    return rows
-  }
-
-  const sqlList: SqlToolDefinition = {
-    name: 'sql_list',
-    description: '列出配置的数据库连接并逐一做连通性测试（SELECT 1）。返回连接名、引擎、目标与健康状态。',
-    parameters: compileParameters({}),
-    output: {
-      schema: listSchema,
-      render: (_args, value) => {
-        const rec = asRecord(value)
-        const connections = Array.isArray(rec.connections) ? rec.connections : []
-        const lines = ['共 ' + connections.length + ' 个数据库连接：']
-        for (const item of connections) {
-          const c = asRecord(item)
-          const target = c.file !== undefined && c.file !== '' ? c.file : c.host + '/' + c.database
-          lines.push('- ' + c.name + '（' + c.engine + ' @ ' + target + '）' + (c.ok === true ? ' ✅' : ' ❌ ' + String(c.error ?? '')))
-        }
-        return [{ type: 'text', text: lines.join('\n') }]
-      },
-    },
-    async execute(_rawArgs: unknown, exec: unknown) {
-      return { connections: await pingAllConnections(executionSignal(exec)) }
-    },
-    timeoutMs: 30000,
+      return entry
+    }))
   }
 
   const sqlQuery: SqlToolDefinition = {
     name: 'sql_query',
-    description: '执行只读 SQL 查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。词法级校验会拒绝 data-modifying CTE、SELECT INTO、FOR UPDATE/FOR SHARE、PRAGMA 赋值与多语句。connection 为连接名（缺省第一个连接）。返回列名与行数据，最多 maxRows 行（超出 truncated=true）。写操作请用 sql_exec。',
+    description: '执行只读 SQL 查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。词法级校验会拒绝 data-modifying CTE、SELECT INTO、FOR UPDATE/FOR SHARE、PRAGMA 赋值与多语句。connection 为连接名（必填，用 sql_settings 查看可用连接）。返回列名与行数据，最多 maxRows 行（超出 truncated=true）。写操作请用 sql_exec。',
     parameters: compileParameters({
       sql: { type: 'string', required: true, description: '只读 SQL 语句（必填，单条）。' },
-      connection: { type: 'string', description: '连接名（可选，缺省第一个连接）。' },
+      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可用连接）。' },
       format: { type: 'string', description: '输出格式：table（默认表格）/ csv / json。csv 与 json 会额外返回 formatted 文本，便于落盘或转存。' },
     }),
     output: {
@@ -393,18 +348,19 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
     async execute(rawArgs: unknown, exec: unknown) {
       const args = asRecord(rawArgs)
       const sql = assertReadQuery(requiredString(args, 'sql', 'SQL 语句'))
+      const maxRows = loadConfig().maxRows
       const { adapter, name } = getAdapter(optionalString(args, 'connection'))
-      const result = await adapter.query(sql, cfg.maxRows + 1, executionSignal(exec))
+      const result = await adapter.query(sql, maxRows + 1, executionSignal(exec))
       const total = result.rows.length
-      const rows = result.rows.slice(0, cfg.maxRows)
+      const rows = result.rows.slice(0, maxRows)
       const format = optionalString(args, 'format')?.toLowerCase() ?? 'table'
       const base = {
         connection: name,
         columns: result.columns,
         rows,
         rowCount: total,
-        truncated: total > cfg.maxRows,
-        maxRows: cfg.maxRows,
+        truncated: total > maxRows,
+        maxRows,
       }
       if (format === 'csv') return { ...base, format, formatted: toCsv(result.columns, rows) }
       if (format === 'json') {
@@ -413,15 +369,15 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
       }
       return base
     },
-    timeoutMs: cfg.queryTimeoutMs,
+    timeoutMs: loadConfig().queryTimeoutMs,
   }
 
   const sqlExec: SqlToolDefinition = {
     name: 'sql_exec',
-    description: '执行写操作或 DDL（INSERT / UPDATE / DELETE / CREATE / ALTER / DROP 等，可多语句脚本）。受 readOnly 模式与写审批门双重保护。返回影响行数（多语句时为 0）。',
+    description: '执行写操作或 DDL（INSERT / UPDATE / DELETE / CREATE / ALTER / DROP 等，可多语句脚本）。受该连接的 readOnly 开关保护。返回影响行数（多语句时为 0）。',
     parameters: compileParameters({
       sql: { type: 'string', required: true, description: '写操作/DDL SQL（必填）。' },
-      connection: { type: 'string', description: '连接名（可选，缺省第一个连接）。' },
+      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可用连接）。' },
     }),
     output: {
       schema: execSchema,
@@ -431,14 +387,17 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
       },
     },
     async execute(rawArgs: unknown, exec: unknown) {
-      if (cfg.readOnly) throw new Error('当前配置 readOnly=true，sql_exec 已被禁用。需要写操作请把插件配置里的 readOnly 改为 false 后重启。')
       const args = asRecord(rawArgs)
       const sql = requiredString(args, 'sql', 'SQL 语句')
-      const { adapter, name } = getAdapter(optionalString(args, 'connection'))
-      const changes = await adapter.exec(sql, executionSignal(exec))
-      return { connection: name, changes, readOnly: false }
+      // 先解析定义并判 readOnly，再建适配器 —— 只读连接不该被建出一个用不上的连接池。
+      const connection = resolveConnection(optionalString(args, 'connection'))
+      if (connection.readOnly === true) {
+        throw new Error('连接 ' + connection.name + ' 的 readOnly=true，sql_exec 已被禁用。需要写操作请把该连接的 readOnly 改为 false（用 sql_connection_set，或直接编辑配置文件）。')
+      }
+      const changes = await adapterFor(connection).exec(sql, executionSignal(exec))
+      return { connection: connection.name, changes, readOnly: false }
     },
-    timeoutMs: cfg.execTimeoutMs,
+    timeoutMs: loadConfig().execTimeoutMs,
   }
 
   const sqlSchema: SqlToolDefinition = {
@@ -446,7 +405,7 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
     description: '查看数据库结构：不给 table 列出全部表；给 table（表名）返回该表的列信息（名称/类型/非空/主键）。',
     parameters: compileParameters({
       table: { type: 'string', description: '表名（可选；缺省列出全部表）。' },
-      connection: { type: 'string', description: '连接名（可选，缺省第一个连接）。' },
+      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可用连接）。' },
     }),
     output: {
       schema: schemaToolSchema,
@@ -482,9 +441,9 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
 
   const sqlStats: SqlToolDefinition = {
     name: 'sql_stats',
-    description: '数据库概览统计：表数量、每张表的行数、库体积（SQLite 按页计算，MySQL/PostgreSQL 走系统表）。connection 为连接名（缺省第一个连接）。适合在写查询前先了解数据规模。',
+    description: '数据库概览统计：表数量、每张表的行数、库体积（SQLite 按页计算，MySQL/PostgreSQL 走系统表）。connection 为连接名（必填，用 sql_settings 查看可用连接）。适合在写查询前先了解数据规模。',
     parameters: compileParameters({
-      connection: { type: 'string', description: '连接名（可选，缺省第一个连接）。' },
+      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可用连接）。' },
     }),
     output: {
       schema: statsSchema,
@@ -540,12 +499,12 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
       }
       return { connection: name, engine, tableCount: tables.filter((t) => t.name !== '').length, tables, sizeBytes }
     },
-    timeoutMs: cfg.queryTimeoutMs,
+    timeoutMs: loadConfig().queryTimeoutMs,
   }
 
   const sqlHealth: SqlToolDefinition = {
     name: 'sql_health',
-    description: 'dsh-sql 自检：逐个连接做连通性测试，并汇总安全配置（只读模式、写审批门、行数上限、超时）。遇到问题时先运行本工具定位。',
+    description: '逐连接做连通性测试（SELECT 1），返回每个连接通不通。连接清单与全局设置请用 sql_settings。',
     parameters: compileParameters({}),
     output: {
       schema: healthSchema,
@@ -553,33 +512,21 @@ export function buildSqlTools(config: ResolvedSqlConfig): { tools: SqlToolDefini
         const rec = asRecord(value)
         const connections = Array.isArray(rec.connections) ? rec.connections : []
         const bad = connections.filter((c) => asRecord(c).ok !== true)
-        const lines = ['dsh-sql 自检' + (bad.length === 0 ? '：全部连接正常。' : '：' + bad.length + ' 个连接异常。')]
+        const lines = ['dsh-sql 探活' + (bad.length === 0 ? '：全部连接正常。' : '：' + bad.length + ' / ' + connections.length + ' 个连接异常。')]
         for (const item of connections) {
           const c = asRecord(item)
-          lines.push('- ' + c.name + '（' + c.engine + '）' + (c.ok === true ? ' ✅' : ' ❌ ' + String(c.error ?? '')))
+          lines.push('- ' + c.name + (c.ok === true ? ' ✅' : ' ❌ ' + String(c.error ?? '')))
         }
-        lines.push('- 只读模式：' + (rec.readOnly === true ? '开（sql_exec 已禁用）' : '关'))
-        lines.push('- 写审批门：' + (rec.writeApproval === true ? '开' : '关'))
-        lines.push('- 行数上限：' + String(rec.maxRows) + '；查询超时 ' + String(rec.queryTimeoutMs) + 'ms；写超时 ' + String(rec.execTimeoutMs) + 'ms')
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },
     async execute(_rawArgs: unknown, exec: unknown) {
       const connections = await pingAllConnections(executionSignal(exec))
       const bad = connections.filter((c) => c.ok !== true)
-      return {
-        ok: bad.length === 0,
-        plugin: 'dsh-sql',
-        connections,
-        readOnly: cfg.readOnly,
-        writeApproval: cfg.writeApproval,
-        maxRows: cfg.maxRows,
-        queryTimeoutMs: cfg.queryTimeoutMs,
-        execTimeoutMs: cfg.execTimeoutMs,
-      }
+      return { ok: bad.length === 0, connections }
     },
     timeoutMs: 30000,
   }
 
-  return { tools: [sqlList, sqlQuery, sqlExec, sqlSchema, sqlStats, sqlHealth], adapters }
+  return { tools: [sqlQuery, sqlExec, sqlSchema, sqlStats, sqlHealth], adapters }
 }

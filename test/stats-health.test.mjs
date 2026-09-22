@@ -1,24 +1,24 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildSqlTools, resolveConfig, toCsv } from '../lib/index.js'
+import { buildSqlTools, resolveSettings, toCsv } from '../lib/index.js'
 
 function makeTools() {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-stats-'))
-  const cfg = resolveConfig({ connections: [{ name: 'local', engine: 'sqlite', file: join(dir, 'stats.db') }], maxRows: 100 })
-  const { tools } = buildSqlTools(cfg)
+  const cfg = resolveSettings({ connections: [{ name: 'local', engine: 'sqlite', file: join(dir, 'stats.db') }], maxRows: 100 })
+  const { tools } = buildSqlTools(() => cfg)
   const exec = tools.find((t) => t.name === 'sql_exec')
   return { tools, exec }
 }
 
 test('sql_stats：表数/行数/库体积', async () => {
   const { tools, exec } = makeTools()
-  await exec.execute({ sql: 'CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)' })
-  await exec.execute({ sql: "INSERT INTO items (label) VALUES ('a'), ('b'), ('c')" })
+  await exec.execute({ sql: 'CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)', connection: 'local' })
+  await exec.execute({ sql: "INSERT INTO items (label) VALUES ('a'), ('b'), ('c')", connection: 'local' })
   const stats = tools.find((t) => t.name === 'sql_stats')
-  const value = await stats.execute({})
+  const value = await stats.execute({ connection: 'local' })
   assert.equal(value.connection, 'local')
   assert.equal(value.engine, 'sqlite')
   assert.ok(value.tableCount >= 1)
@@ -32,15 +32,15 @@ test('sql_stats：表数/行数/库体积', async () => {
 test('sql_stats：不存在的连接给中文指引', async () => {
   const { tools } = makeTools()
   const stats = tools.find((t) => t.name === 'sql_stats')
-  await assert.rejects(() => stats.execute({ connection: 'nope' }), /sql_list/)
+  await assert.rejects(() => stats.execute({ connection: 'nope' }), /sql_settings/)
 })
 
 test('sql_query format=csv：含表头与转义', async () => {
   const { tools, exec } = makeTools()
-  await exec.execute({ sql: 'CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT)' })
-  await exec.execute({ sql: "INSERT INTO t (note) VALUES ('he said \"hi\", ok'), ('line1\nline2')" })
+  await exec.execute({ sql: 'CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT)', connection: 'local' })
+  await exec.execute({ sql: "INSERT INTO t (note) VALUES ('he said \"hi\", ok'), ('line1\nline2')", connection: 'local' })
   const query = tools.find((t) => t.name === 'sql_query')
-  const value = await query.execute({ sql: 'SELECT id, note FROM t ORDER BY id', format: 'csv' })
+  const value = await query.execute({ sql: 'SELECT id, note FROM t ORDER BY id', format: 'csv', connection: 'local' })
   assert.equal(value.format, 'csv')
   const lines = value.formatted.split('\n')
   assert.equal(lines[0], 'id,note')
@@ -52,19 +52,19 @@ test('sql_query format=csv：含表头与转义', async () => {
 
 test('sql_query format=json：可解析回对象数组', async () => {
   const { tools, exec } = makeTools()
-  await exec.execute({ sql: 'CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT)' })
-  await exec.execute({ sql: "INSERT INTO t (note) VALUES ('x')" })
+  await exec.execute({ sql: 'CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT)', connection: 'local' })
+  await exec.execute({ sql: "INSERT INTO t (note) VALUES ('x')", connection: 'local' })
   const query = tools.find((t) => t.name === 'sql_query')
-  const value = await query.execute({ sql: 'SELECT id, note FROM t', format: 'json' })
+  const value = await query.execute({ sql: 'SELECT id, note FROM t', format: 'json', connection: 'local' })
   const parsed = JSON.parse(value.formatted)
   assert.deepEqual(parsed, [{ id: 1, note: 'x' }])
 })
 
 test('sql_query 默认格式不产生 formatted 字段', async () => {
   const { tools, exec } = makeTools()
-  await exec.execute({ sql: 'CREATE TABLE t (id INTEGER PRIMARY KEY)' })
+  await exec.execute({ sql: 'CREATE TABLE t (id INTEGER PRIMARY KEY)', connection: 'local' })
   const query = tools.find((t) => t.name === 'sql_query')
-  const value = await query.execute({ sql: 'SELECT * FROM t' })
+  const value = await query.execute({ sql: 'SELECT * FROM t', connection: 'local' })
   assert.equal(value.formatted, undefined)
 })
 
@@ -72,25 +72,48 @@ test('toCsv 空结果只输出表头', () => {
   assert.equal(toCsv(['a', 'b'], []), 'a,b')
 })
 
-test('sql_health：连接正常时 ok=true 且汇总安全配置', async () => {
+test('sql_health：只探活，不含全局设置', async () => {
   const { tools } = makeTools()
   const health = tools.find((t) => t.name === 'sql_health')
   const value = await health.execute({})
   assert.equal(value.ok, true)
   assert.equal(value.connections[0].ok, true)
-  assert.equal(value.readOnly, false)
-  assert.equal(value.writeApproval, true)
-  assert.equal(typeof value.maxRows, 'number')
+  assert.equal(value.connections[0].name, 'local')
+  assert.equal(value.maxRows, undefined, '全局设置归 sql_settings，不再出现在探活结果里')
+  assert.deepEqual(Object.keys(value).sort(), ['connections', 'ok'])
   const blocks = health.output.render({}, value)
-  assert.match(blocks[0].text, /自检：全部连接正常/)
+  assert.match(blocks[0].text, /探活：全部连接正常/)
 })
 
 test('sql_health：坏连接报 ok=false 且错误可读', async () => {
-  const cfg = resolveConfig({ connections: [{ name: 'bad', engine: 'mysql', host: '127.0.0.1', port: 1, database: 'x', user: 'u', password: 'p' }], maxRows: 10, queryTimeoutMs: 5000, execTimeoutMs: 5000 })
-  const { tools } = buildSqlTools(cfg)
+  const cfg = resolveSettings({ connections: [{ name: 'bad', engine: 'mysql', host: '127.0.0.1', port: 1, database: 'x', user: 'u', password: 'p' }], maxRows: 10, queryTimeoutMs: 5000, execTimeoutMs: 5000 })
+  const { tools } = buildSqlTools(() => cfg)
   const health = tools.find((t) => t.name === 'sql_health')
   const value = await health.execute({})
   assert.equal(value.ok, false)
   assert.equal(value.connections[0].ok, false)
   assert.notEqual(value.connections[0].error, '')
+})
+
+test('sql_health：多连接并发探活，结果按配置顺序返回', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-ping-'))
+  const cfg = resolveSettings({
+    connections: [
+      { name: 'a', engine: 'sqlite', file: join(dir, 'a.db') },
+      { name: 'b', engine: 'sqlite', file: join(dir, 'b.db') },
+      { name: 'c', engine: 'sqlite', file: join(dir, 'c.db') },
+    ],
+  })
+  const { tools, adapters } = buildSqlTools(() => cfg)
+  const health = tools.find((t) => t.name === 'sql_health')
+  const started = Date.now()
+  const value = await health.execute({})
+  const elapsed = Date.now() - started
+  assert.equal(value.ok, true)
+  assert.deepEqual(value.connections.map((c) => c.name), ['a', 'b', 'c'], '保持配置顺序')
+  assert.ok(value.connections.every((c) => c.ok === true && c.error === ''))
+  assert.ok(elapsed < 2000, '并发探活不该串行累加耗时')
+  for (const adapter of adapters.values()) await adapter.close()
+  // Windows 上 SQLite 句柄释放有延迟，直接 rm 会偶发 EPERM
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
 })

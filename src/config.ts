@@ -1,10 +1,10 @@
 /**
- * dsh-sql 配置解析：多连接定义、行数上限、只读模式与写审批策略。
+ * dsh-sql 设置解析与校验：类型即 `$DSH_HOME/sql/settings.json` 的形状。
  *
  * @module dsh-sql/config
  */
 
-/** 单个数据库连接（行配置）。 */
+/** 单个数据库连接。 */
 export interface SqlConnectionConfig {
   name: string
   engine: 'sqlite' | 'mysql' | 'postgres'
@@ -14,24 +14,24 @@ export interface SqlConnectionConfig {
   user?: string
   password?: string
   database?: string
+  /** 该连接是否禁用写操作（默认 false，即允许写）。 */
+  readOnly?: boolean
+  /** 连接用途说明（展示用，最长 100 字符）。 */
+  description?: string
 }
 
-/** 插件行配置。 */
-export interface SqlConfig {
+/** 设置文件的形状。 */
+export interface SqlSettings {
   connections?: SqlConnectionConfig[]
   maxRows?: number
-  readOnly?: boolean
-  writeApproval?: boolean
   queryTimeoutMs?: number
   execTimeoutMs?: number
 }
 
-/** 解析后的配置。 */
-export interface ResolvedSqlConfig {
+/** 解析后的设置。 */
+export interface ResolvedSqlSettings {
   connections: SqlConnectionConfig[]
   maxRows: number
-  readOnly: boolean
-  writeApproval: boolean
   queryTimeoutMs: number
   execTimeoutMs: number
 }
@@ -43,11 +43,14 @@ export function passwordEnvName(name: string): string {
   return 'DSH_SQL_PASSWORD_' + name.toUpperCase().replace(/[^A-Z0-9_]/g, '_')
 }
 
+/** description 字段最大长度，超出截断。 */
+export const DESCRIPTION_MAX_LENGTH = 100
+
 /**
- * 解析并校验配置；无连接时给一个内存 SQLite 兜底连接。
+ * 解析并校验设置；无连接时给一个内存 SQLite 兜底连接。
  */
-export function resolveConfig(config: SqlConfig | undefined | null, env: NodeJS.ProcessEnv = process.env): ResolvedSqlConfig {
-  const cfg = config ?? {}
+export function resolveSettings(settings: SqlSettings | undefined | null, env: NodeJS.ProcessEnv = process.env): ResolvedSqlSettings {
+  const cfg = settings ?? {}
   const rawConnections = Array.isArray(cfg.connections) ? cfg.connections : []
   const connections: SqlConnectionConfig[] = []
   const seen = new Set<string>()
@@ -60,21 +63,28 @@ export function resolveConfig(config: SqlConfig | undefined | null, env: NodeJS.
     const engine = raw.engine as (typeof ENGINES)[number] | undefined
     if (!ENGINES.includes(engine as (typeof ENGINES)[number])) throw new Error('连接 ' + name + ' 的 engine 必须是 sqlite / mysql / postgres 之一。')
     const connection: SqlConnectionConfig = { name, engine: engine as (typeof ENGINES)[number] }
+    connection.readOnly = raw.readOnly === true
+    if (typeof raw.description === 'string' && raw.description.trim() !== '') {
+      connection.description = raw.description.trim().slice(0, DESCRIPTION_MAX_LENGTH)
+    }
     if (connection.engine === 'sqlite') {
       connection.file = typeof raw.file === 'string' && raw.file.trim() !== '' ? raw.file.trim() : ':memory:'
     } else {
       connection.host = typeof raw.host === 'string' && raw.host.trim() !== '' ? raw.host.trim() : 'localhost'
       connection.port = typeof raw.port === 'number' && Number.isInteger(raw.port) && raw.port > 0 ? raw.port : (connection.engine === 'postgres' ? 5432 : 3306)
       connection.user = typeof raw.user === 'string' && raw.user.trim() !== '' ? raw.user.trim() : ''
-      connection.database = typeof raw.database === 'string' && raw.database.trim() !== '' ? raw.database.trim() : ''
+      connection.database = typeof raw.database === 'string' ? raw.database.trim() : ''
       const direct = typeof raw.password === 'string' ? raw.password.trim() : ''
       connection.password = direct !== '' ? direct : (env[passwordEnvName(name)]?.trim() ?? '')
-      if (connection.database === '') throw new Error('连接 ' + name + ' 缺少 database 字段。')
+      // PostgreSQL 必须指定库；MySQL 的 database 可选（不填即不指定默认库，可用全限定名查询）。
+      if (connection.engine === 'postgres' && connection.database === '') {
+        throw new Error('连接 ' + name + '（postgres）缺少 database 字段。')
+      }
     }
     connections.push(connection)
   }
   if (connections.length === 0) {
-    connections.push({ name: 'default', engine: 'sqlite', file: ':memory:' })
+    connections.push({ name: 'default', engine: 'sqlite', file: ':memory:', readOnly: false })
   }
   let maxRows = 1000
   if (cfg.maxRows !== undefined) {
@@ -91,9 +101,7 @@ export function resolveConfig(config: SqlConfig | undefined | null, env: NodeJS.
     if (typeof cfg.execTimeoutMs !== 'number' || !Number.isFinite(cfg.execTimeoutMs) || cfg.execTimeoutMs <= 0) throw new Error('execTimeoutMs 必须是大于 0 的数字（毫秒）。')
     execTimeoutMs = Math.min(600000, Math.max(5000, Math.round(cfg.execTimeoutMs)))
   }
-  const readOnly = cfg.readOnly === true
-  const writeApproval = cfg.writeApproval !== false
-  return { connections, maxRows, readOnly, writeApproval, queryTimeoutMs, execTimeoutMs }
+  return { connections, maxRows, queryTimeoutMs, execTimeoutMs }
 }
 
 /** 校验表名/标识符，防注入到 schema 语句。 */

@@ -1,24 +1,4 @@
-# dsh-sql 组合包补丁：把数据库工具插件行插入 profile。
-# 本补丁按 id 覆盖；用户应在自己 profile 的 cordis.patch.yml 里覆盖本行的整个
-# config（见 README 的配置示例）。配置缺失时插件仍会加载，默认注册一个
-# 内存 SQLite 连接（sql_list 可见）。
-#
-# 示例（用户 profile 的 cordis.patch.yml）：
-#   - id: sql
-#     name: 'dsh-sql'
-#     config:
-#       connections:
-#         - name: local
-#           engine: sqlite
-#           file: E:\data\app.db
-#       maxRows: 1000      # sql_query 返回行数上限（1-10000，默认 1000）
-#       queryTimeoutMs: 60000 # 单次查询超时（5 秒 - 10 分钟）
-#       execTimeoutMs: 120000 # 单次写操作超时（5 秒 - 10 分钟）
-#       readOnly: false    # true 时 sql_exec 被禁用
-#       writeApproval: true # 写操作先弹审批（默认 true）
-#
+# dsh-sql — 声明挂载；插件没有配置项，一切设置见 $DSH_HOME/sql/settings.json
 - insert:
     - id: sql
       name: 'dsh-sql'
-      config:
-        maxRows: 1000
