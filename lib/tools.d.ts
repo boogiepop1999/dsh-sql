@@ -8,8 +8,6 @@
 import { type DatabaseAdapter } from './adapters.js';
 import { type ResolvedSqlSettings } from './config.js';
 import { type SqlToolDefinition } from './tool-kit.js';
-/** 数语句条数 —— 供 sql_exec 判断是否多语句。 */
-export declare function countStatements(sql: string): number;
 /** 校验只读查询：词法去噪后白名单开头 + 写关键字扫描 + 单语句。 */
 export declare function assertReadQuery(sql: string): string;
 /** 查询结果转 CSV 文本（RFC 4180 风格转义）。 */

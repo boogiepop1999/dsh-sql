@@ -257,3 +257,30 @@ test('message 为空的 Error 会按 code / name 兜底出可读文本', async (
     },
   )
 })
+
+test('PostgreSQL：client.query() 返回 rejected promise 时被接住，不崩进程也不挂起', async () => {
+  // 真实场景：pg 在连接已损坏时不 emit 'error'，而是让 client.query() 返回 rejected
+  // promise（"Client has encountered a connection error and is not queryable"）。
+  // 旧实现丢弃了这个返回值 —— 后果是 unhandledRejection 直接崩掉 Node 进程、
+  // 本 Promise 永不 settle、那条 client 永不归还。
+  const adapter = createAdapter({ name: 'pg', engine: 'postgres', host: 'h', port: 5432, user: 'u', password: 'p', database: 'app' })
+  const released = []
+  adapter.pool = {
+    async connect() {
+      return {
+        release(force) { released.push(force === true) },
+        query() {
+          return Promise.reject(new Error('Client has encountered a connection error and is not queryable'))
+        },
+      }
+    },
+  }
+  await assert.rejects(
+    () => adapter.query('SELECT 1', 10, new AbortController().signal),
+    (error) => {
+      assert.match(error.message, /not queryable/, '真实原因要透出来')
+      return true
+    },
+  )
+  assert.deepEqual(released, [true], '损坏的连接必须被销毁，不能放回池里复用')
+})

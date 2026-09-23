@@ -166,12 +166,18 @@ test('超时提示：查询可有限重试，写操作一律禁止重试', () =>
   }
 })
 
-test('isAbortError 只认中止类错误', () => {
+test('isAbortError 只认中止信号，不拿 message 做子串匹配', () => {
   const abort = new Error('The operation was aborted.')
   abort.name = 'AbortError'
   assert.equal(isAbortError(abort), true)
+  assert.equal(isAbortError(Object.assign(new Error('x'), { code: 'ABORT_ERR' })), true)
   assert.equal(isAbortError(new Error('connect ECONNREFUSED')), false)
   assert.equal(isAbortError('not an error'), false)
+  // 回归：message 里带 abort 的普通数据库错误不能被误判成超时，
+  // 否则会被套上「禁止重试，请与用户确认」，把 agent 的自愈路径掐死。
+  assert.equal(isAbortError(new Error('no such table: abort_log')), false)
+  assert.equal(isAbortError(new Error('abort_table_permission denied')), false)
+  assert.equal(isAbortError(new Error('relation "abort_log" does not exist')), false)
 })
 
 test('assertIdentifier 防注入', () => {

@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite'
 import mysql from 'mysql2/promise'
 import pg from 'pg'
 import { assertIdentifier, missingConnectionFields, type SqlConnectionConfig } from './config.js'
+import { countStatements } from './sql-lex.js'
 
 /** 查询结果：列名 + 行（值数组，无损 JSON 友好）。 */
 export interface QueryResult {
@@ -123,7 +124,7 @@ function streamMysqlQuery(corePool: { query(querySql: string): any }, sql: strin
   })
 }
 
-/** pg's `rows` option is a page size; row events avoid its full result accumulator. */
+/** pg 的 `rows` 选项是「每页大小」，用 row 事件才能避开它的全量结果累积。 */
 function streamPostgresQuery(client: pg.PoolClient, sql: string, limit: number, discard: () => void): Promise<QueryResult> {
   return new Promise<QueryResult>((resolve, reject) => {
     let settled = false
@@ -153,7 +154,19 @@ function streamPostgresQuery(client: pg.PoolClient, sql: string, limit: number, 
       settled = true
       reject(describeDriverError(error))
     })
-    client.query(query)
+    // client.query() 的返回值必须接住：pg 在连接已损坏时不 emit 'error' 事件，
+    // 而是让这个 promise reject（"Client has encountered a connection error and is not queryable"）。
+    // 不接的后果是三重灾难 —— unhandledRejection 直接崩掉 Node 进程、本 Promise 永不 settle、
+    // 那条 client 永不归还，跑几次就耗尽连接池。
+    const sent = client.query(query) as unknown
+    if (sent instanceof Promise) {
+      sent.catch((error: unknown) => {
+        if (settled) return
+        settled = true
+        discard()
+        reject(describeDriverError(error))
+      })
+    }
   })
 }
 
@@ -203,14 +216,17 @@ class SqliteAdapter implements DatabaseAdapter {
   }
   async exec(sql: string, signal?: AbortSignal) {
     signal?.throwIfAborted()
-    const single = sql.replace(/;\s*$/, '').trim()
     // 多语句必须拦下：node:sqlite 的 prepare().run() 遇到多语句**不报错、静默只执行第一条**，
-    // 后面的语句会被无声丢弃。工具的 sql_exec 已拦一道，这里兜住直接调用适配器的场景。
-    // 与 mysql / postgres 行为一致（那两个由驱动报错）。
-    if (single.includes(';')) {
+    // 后面的语句会被无声丢弃。工具层已拦一道，这里兜住直接调用适配器的场景，
+    // 与 mysql / postgres 一致（那两个由驱动报错）。
+    //
+    // 判断用 countStatements（去噪后数）而不是裸 includes(';')：后者会被注释或字面量里的
+    // 分号骗到，把 `CREATE TABLE t (id INT) /* ; */` 这种单语句误报成多语句。
+    // 注意执行仍用原始 sql —— 去噪会抹掉字面量，只适合拿来判断。
+    if (countStatements(sql) > 1) {
       throw new Error('SQLite 一次只能执行一条语句。请拆成多次调用。')
     }
-    const result = this.db.prepare(single).run()
+    const result = this.db.prepare(sql.replace(/;\s*$/, '').trim()).run()
     signal?.throwIfAborted()
     return Number(result.changes)
   }
@@ -411,6 +427,12 @@ class PostgresAdapter implements DatabaseAdapter {
 
 /** 按连接配置创建适配器。 */
 export function createAdapter(connection: SqlConnectionConfig): DatabaseAdapter {
+  // engine 在类型上是联合类型，但配置来自 JSON —— 运行时可能是任何值。
+  // 这里不兜底成 postgres：把 "oracle" 当成 postgres 去连，报出来的是 DNS 错误，
+  // 完全看不出真正原因是引擎名写错了。
+  if (connection.engine !== 'sqlite' && connection.engine !== 'mysql' && connection.engine !== 'postgres') {
+    throw new Error('未知引擎 ' + JSON.stringify(connection.engine) + '（可选：sqlite / mysql / postgres）。请用 sql_connection_set 修正。')
+  }
   // 不补默认值：缺字段要么是配置被手改坏了，要么是绕过 sql_connection_set 写入的。
   // 报出缺了什么，好过悄悄连到 localhost 或内存库上。
   // 规则与写入侧共用（missingConnectionFields），这里只负责措辞。

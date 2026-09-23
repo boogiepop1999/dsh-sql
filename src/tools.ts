@@ -7,6 +7,7 @@
  */
 import { createAdapter, type DatabaseAdapter } from './adapters.js'
 import { type ResolvedSqlSettings, type NamedSqlConnection, splitConnectionsByEnv, QUERY_TIMEOUT_MS, EXEC_TIMEOUT_MS, STATS_TIMEOUT_MS } from './config.js'
+import { countStatements, splitStatements, stripSqlNoise } from './sql-lex.js'
 import {
   asRecord,
   compileParameters,
@@ -22,96 +23,8 @@ import {
 /** 只读语句关键字白名单。 */
 const READ_KEYWORDS = /^(select|pragma|explain|show|describe|desc|with)\b/i
 
-/** 去掉字符串、引号标识符与注释，保留真实 SQL 关键字与分号。 */
-function stripSqlNoise(sql: string): string {
-  let out = ''
-  let i = 0
-  while (i < sql.length) {
-    const ch = sql[i]
-    const next = sql[i + 1]
-    if (ch === '-' && next === '-') {
-      i += 2
-      while (i < sql.length && sql[i] !== '\n') i += 1
-      continue
-    }
-    if (ch === '/' && next === '*') {
-      i += 2
-      while (i + 1 < sql.length && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1
-      i += 2
-      continue
-    }
-    if (ch === '#' && (i === 0 || /\s/.test(sql[i - 1]))) {
-      if (/^#(?:>>?|-)/.test(sql.slice(i))) {
-        out += ch
-        i += 1
-        continue
-      }
-      i += 1
-      while (i < sql.length && sql[i] !== '\n') i += 1
-      continue
-    }
-    if (ch === "'") {
-      out += ' '
-      i += 1
-      while (i < sql.length) {
-        if (sql[i] === "'" && sql[i + 1] === "'") { i += 2; continue }
-        if (sql[i] === "'") { i += 1; break }
-        if (sql[i] === '\\') { i += 2; continue }
-        i += 1
-      }
-      continue
-    }
-    if (ch === '"' || ch === '`') {
-      out += ' '
-      i += 1
-      while (i < sql.length) {
-        if (sql[i] === ch) { i += 1; break }
-        if (sql[i] === '\\') { i += 2; continue }
-        i += 1
-      }
-      continue
-    }
-    if (ch === '[') {
-      out += ' '
-      i += 1
-      while (i < sql.length && sql[i] !== ']') i += 1
-      i += 1
-      continue
-    }
-    if (ch === '$') {
-      const dollar = /^\$[A-Za-z_][A-Za-z0-9_]*\$|^\$\$/.exec(sql.slice(i))
-      if (dollar !== null) {
-        out += ' '
-        i += dollar[0].length
-        const end = sql.indexOf(dollar[0], i)
-        i = end === -1 ? sql.length : end + dollar[0].length
-        continue
-      }
-    }
-    out += ch
-    i += 1
-  }
-  return out
-}
-
 /** 写操作关键字：出在 SELECT/EXPLAIN/WITH 语句里即拒绝。 */
 const WRITE_KEYWORDS = /\b(insert|update|delete|replace|merge|drop|alter|create|truncate|call|execute|copy|grant|revoke|attach|detach|vacuum|reindex|refresh|set|reset|begin|commit|rollback|savepoint|release|analyze|load_extension)\b/i
-
-/**
- * 数语句条数（去噪后按分号切）。
- *
- * 三个引擎的驱动都不接受多语句，**提前拦下是为了给出「请拆成多次调用」这种能照做的报错**，
- * 否则 AI 拿到的是驱动的语法错误，会以为 SQL 本身写错了。
- */
-/** 去噪后按分号切出非空语句（`countStatements` 与 `assertReadQuery` 共用这一份拆分规则）。 */
-function splitStatements(sql: string): string[] {
-  return stripSqlNoise(sql).split(';').filter((part) => part.trim() !== '')
-}
-
-/** 数语句条数 —— 供 sql_exec 判断是否多语句。 */
-export function countStatements(sql: string): number {
-  return splitStatements(sql).length
-}
 
 /** 校验只读查询：词法去噪后白名单开头 + 写关键字扫描 + 单语句。 */
 export function assertReadQuery(sql: string): string {

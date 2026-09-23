@@ -33,6 +33,13 @@ test('SQLite：exec 返回 changes；多语句拦下（不静默丢语句）', a
     () => adapter.exec('CREATE TABLE a (x INTEGER); CREATE TABLE b (y INTEGER)'),
     /一次只能执行一条语句/,
   )
+  // 但注释里的分号不能被算成多语句（判断走去噪，执行用原文）
+  await adapter.exec('CREATE TABLE a1 (x INTEGER) /* ; */')
+  await adapter.exec('CREATE TABLE a2 (x INTEGER) -- ;')
+  const names = await adapter.listTables()
+  assert.ok(names.includes('a1'), '注释含分号的单语句要能执行')
+  assert.ok(names.includes('a2'), '行注释含分号的单语句要能执行')
+  assert.ok(!names.includes('b'), '被拦下的多语句不应执行')
 })
 
 test('SQLite：query(limit) 只迭代前 N 行，不全量载入', async () => {

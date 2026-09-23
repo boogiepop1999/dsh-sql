@@ -85,11 +85,17 @@ export const textOutput = {
 /** 所有配置管理工具共用的告诫语。 */
 export const CONFIG_WRITE_WARNING = '⚠ **仅当用户明确要求时才调用 —— 不得自行判断、不得主动调用。**'
 
-/** 判断一个错误是否是中止（超时 / 取消）导致的。 */
+/**
+ * 判断一个错误是否是中止（超时 / 取消）导致的。
+ *
+ * **不能拿 message 做子串匹配** —— 那样 `no such table: abort_log` 这类普通错误
+ * 会被误判成超时，进而被套上「禁止重试，请与用户确认」，把 agent 的自愈路径掐死。
+ * 只认明确的信号：`name === 'AbortError'` 或 `code === 'ABORT_ERR'`。
+ */
 export function isAbortError(error: unknown): boolean {
   if (!(error instanceof Error)) return false
   if (error.name === 'AbortError') return true
-  return /aborted|abort/i.test(error.message)
+  return (error as { code?: unknown }).code === 'ABORT_ERR'
 }
 
 /**

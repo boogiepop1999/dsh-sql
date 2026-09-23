@@ -60,7 +60,13 @@ export declare const textOutput: {
 };
 /** 所有配置管理工具共用的告诫语。 */
 export declare const CONFIG_WRITE_WARNING = "\u26A0 **\u4EC5\u5F53\u7528\u6237\u660E\u786E\u8981\u6C42\u65F6\u624D\u8C03\u7528 \u2014\u2014 \u4E0D\u5F97\u81EA\u884C\u5224\u65AD\u3001\u4E0D\u5F97\u4E3B\u52A8\u8C03\u7528\u3002**";
-/** 判断一个错误是否是中止（超时 / 取消）导致的。 */
+/**
+ * 判断一个错误是否是中止（超时 / 取消）导致的。
+ *
+ * **不能拿 message 做子串匹配** —— 那样 `no such table: abort_log` 这类普通错误
+ * 会被误判成超时，进而被套上「禁止重试，请与用户确认」，把 agent 的自愈路径掐死。
+ * 只认明确的信号：`name === 'AbortError'` 或 `code === 'ABORT_ERR'`。
+ */
 export declare function isAbortError(error: unknown): boolean;
 /**
  * 查询超时的提示：点明这是工具护栏（不是环境不稳），并给出「可有限重试」的边界。

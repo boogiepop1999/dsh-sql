@@ -335,6 +335,36 @@ test('sql_config_set：超范围报错且不落盘', async () => {
   } finally { box.cleanup() }
 })
 
+test('数值字段只收真正的 number，不做隐式转换', async () => {
+  const box = makeSandbox()
+  try {
+    await box.tool('sql_settings').execute({})
+    // Number(true) === 1、Number('5') === 5 都能「算」出合法值，静默接受会写坏配置
+    await assert.rejects(() => box.tool('sql_config_set').execute({ maxRows: true }), /必须是 1~10000 之间的数字/)
+    await assert.rejects(() => box.tool('sql_config_set').execute({ maxRows: '500' }), /必须是 1~10000 之间的数字/)
+    await assert.rejects(
+      () => box.tool('sql_connection_set').execute(connArgs({ name: 'p', port: '3306' })),
+      /port 必须是正整数/,
+    )
+  } finally { box.cleanup() }
+})
+
+test('readOnly 只收布尔值 —— 传字符串不能静默变成可写', async () => {
+  const box = makeSandbox()
+  try {
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'r' }))
+    // 旧实现是 value === true，传 'true' 会落盘 readOnly: false（想开只读却得到可写连接）
+    await assert.rejects(
+      () => box.tool('sql_connection_set').execute({ name: 'r', readOnly: 'true' }),
+      /readOnly 必须是布尔值/,
+    )
+    assert.notEqual(box.conn('r').readOnly, false, '不能被静默改成 false')
+    // 真正的布尔仍然照常工作
+    await box.tool('sql_connection_set').execute({ name: 'r', readOnly: true })
+    assert.equal(box.conn('r').readOnly, true)
+  } finally { box.cleanup() }
+})
+
 test('sql_config_set：只传已废弃的超时字段会被当成没给任何参数', async () => {
   const box = makeSandbox()
   try {
