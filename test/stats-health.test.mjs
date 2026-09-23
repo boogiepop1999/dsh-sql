@@ -173,3 +173,39 @@ test('sql_health：activeEnv 下没有可见连接时给指引而不是「全部
   assert.match(blocks[0].text, /没有可见的连接/)
   assert.doesNotMatch(blocks[0].text, /全部连接正常/, '0 个连接不该说成全部正常')
 })
+
+test('sql_schema：查不存在的表说「不存在」，不能说成「0 张表」', async () => {
+  const { tools, exec } = makeTools()
+  await exec.execute({ sql: 'CREATE TABLE items (id INTEGER)', connection: 'local' })
+  const schema = tools.find((t) => t.name === 'sql_schema')
+
+  const missing = await schema.execute({ connection: 'local', table: 'nope' })
+  assert.equal(missing.tableMissing, true)
+  const text = schema.output.render({}, missing)[0].text
+  assert.match(text, /不存在/)
+  assert.doesNotMatch(text, /共 0 张表/, '「表不存在」不能让 AI 以为库是空的')
+  assert.match(text, /items/, '附上可用表名，方便确认是写错还是没权限')
+
+  const ok = await schema.execute({ connection: 'local', table: 'items' })
+  assert.equal(ok.tableMissing, false)
+  assert.match(schema.output.render({}, ok)[0].text, /表 items 的列/)
+})
+
+test('sql_stats：表数用 tableCount 且失败原因要显式给出', async () => {
+  const cfg = resolveSettings({ connections: { local: { engine: 'sqlite', file: ':memory:' } } })
+  const { tools } = buildSqlTools(() => cfg)
+  const stats = tools.find((t) => t.name === 'sql_stats')
+
+  // 直接构造 execute 在「表清单/库体积查询失败」时会返回的形状
+  const value = {
+    connection: 'my', engine: 'mysql', tableCount: 2, sizeBytes: -1,
+    tables: [{ name: 'users', rowCount: 42 }, { name: 'orders', rowCount: 18 }],
+    tablesError: 'permission denied for information_schema',
+    sizeError: 'Access denied for PROCESS privilege',
+  }
+  const text = stats.output.render({}, value)[0].text
+  assert.match(text, /共 2 张表/, '计数用 tableCount')
+  assert.match(text, /表清单不可用：permission denied/)
+  assert.match(text, /库体积不可用：Access denied/)
+  assert.doesNotMatch(text, /共 3 张表/, '不能把失败项也算成表')
+})

@@ -81,6 +81,8 @@ const schemaToolSchema = {
   type: 'object',
   properties: {
     connection: { type: 'string' },
+    table: { type: 'string' },
+    tableMissing: { type: 'boolean' },
     tables: { type: 'array', items: { type: 'string' } },
     columns: {
       type: 'array',
@@ -123,14 +125,20 @@ function formatBytes(bytes: number): string {
 }
 
 /** 库体积：SQLite 用页数×页大小；MySQL/PostgreSQL 走系统函数；失败抛错由调用方兜底。 */
-async function databaseSize(adapter: DatabaseAdapter, engine: string, signal?: AbortSignal): Promise<number> {
+async function databaseSize(adapter: DatabaseAdapter, engine: string, database: string | undefined, signal?: AbortSignal): Promise<number> {
   if (engine === 'sqlite') {
     const pageCount = await adapter.query('PRAGMA page_count', 1, signal)
     const pageSize = await adapter.query('PRAGMA page_size', 1, signal)
     return Number(pageCount.rows[0]?.[0] ?? 0) * Number(pageSize.rows[0]?.[0] ?? 0)
   }
   if (engine === 'mysql') {
-    const result = await adapter.query('SELECT SUM(DATA_LENGTH + INDEX_LENGTH) FROM information_schema.tables WHERE TABLE_SCHEMA = DATABASE()', 1, signal)
+    // 用配置里的库名，不用 DATABASE() —— 后者依赖会话默认库，没设时返回 NULL 会静默给出空结果。
+    // 调用方已保证 mysql 走到这里时 database 一定存在。
+    const result = await adapter.query(
+      "SELECT SUM(DATA_LENGTH + INDEX_LENGTH) FROM information_schema.tables WHERE TABLE_SCHEMA = '" + String(database).replace(/'/g, "''") + "'",
+      1,
+      signal,
+    )
     return Number(result.rows[0]?.[0] ?? -1)
   }
   const result = await adapter.query('SELECT pg_database_size(current_database())', 1, signal)
@@ -144,7 +152,9 @@ const statsSchema = {
     engine: { type: 'string' },
     tableCount: { type: 'integer' },
     tables: { type: 'array', items: { type: 'object', additionalProperties: true } },
+    tablesError: { type: 'string' },
     sizeBytes: { type: 'integer' },
+    sizeError: { type: 'string' },
   },
   additionalProperties: true,
 }
@@ -373,6 +383,13 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
           }
           return [{ type: 'text', text: lines.join('\n') }]
         }
+        // 指定了表名却查不到列 —— 是「这张表不存在」（或没权限），
+        // 不能说成「库里有 0 张表」，那会让 AI 以为库是空的。
+        if (rec.tableMissing === true) {
+          const known = Array.isArray(rec.tables) ? rec.tables : []
+          const hint = known.length > 0 ? '可用表（前 20 张）：' + known.slice(0, 20).join(', ') : '该连接下没有可见的表。'
+          return [{ type: 'text', text: '表 ' + rec.table + ' 不存在，或当前用户没有权限查看它。' + hint }]
+        }
         const tables = Array.isArray(rec.tables) ? rec.tables : []
         return [{ type: 'text', text: '共 ' + tables.length + ' 张表：' + tables.join(', ') }]
       },
@@ -384,7 +401,9 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
       const signal = executionSignal(exec)
       if (table !== undefined) {
         const columns = await adapter.describeTable(table, signal)
-        return { connection: name, table, columns, tables: [] }
+        // 查不到列时把全部表名一并带上，方便确认是表名写错还是真没权限。
+        const tables = columns.length === 0 ? await adapter.listTables(signal) : []
+        return { connection: name, table, columns, tables, tableMissing: columns.length === 0 }
       }
       const tables = await adapter.listTables(signal)
       return { connection: name, tables, columns: [] }
@@ -403,7 +422,12 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
       render: (_args, value) => {
         const rec = asRecord(value)
         const tables = Array.isArray(rec.tables) ? rec.tables : []
-        const lines = ['连接 ' + rec.connection + '（' + rec.engine + '）：共 ' + tables.length + ' 张表' + (typeof rec.sizeBytes === 'number' && rec.sizeBytes >= 0 ? '，库体积 ' + formatBytes(rec.sizeBytes) : '') + '。']
+        // 计数用 tableCount（execute 里已剔除失败项），不能拿 tables.length 当表数。
+        const count = typeof rec.tableCount === 'number' ? rec.tableCount : tables.length
+        const size = typeof rec.sizeBytes === 'number' && rec.sizeBytes >= 0 ? '，库体积 ' + formatBytes(rec.sizeBytes) : ''
+        const lines = ['连接 ' + rec.connection + '（' + rec.engine + '）：共 ' + count + ' 张表' + size + '。']
+        if (typeof rec.tablesError === 'string' && rec.tablesError !== '') lines.push('⚠ 表清单不可用：' + rec.tablesError)
+        if (typeof rec.sizeError === 'string' && rec.sizeError !== '') lines.push('⚠ 库体积不可用：' + rec.sizeError)
         for (const item of tables.slice(0, 30)) {
           const t = asRecord(item)
           lines.push('- ' + t.name + '：' + (typeof t.rowCount === 'number' ? t.rowCount + ' 行' : '行数未知' + (t.error ? '（' + t.error + '）' : '')))
@@ -414,21 +438,34 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
     },
     async execute(rawArgs: unknown, exec: unknown) {
       const args = asRecord(rawArgs)
-      const { adapter, name } = getAdapter(optionalString(args, 'connection'))
+      const { adapter, name, connection } = getAdapter(optionalString(args, 'connection'))
       const engine = adapter.engine
       const signal = executionSignal(exec)
+      // MySQL 的库体积与表清单都依赖「当前库」，而 database 是可选的。
+      // 不设默认库时不猜也不绕（DATABASE() 会返回 NULL，静默给出空结果），如实标记不可用。
+      const noDefaultDb = engine === 'mysql' && connection.database === undefined
       let sizeBytes = -1
-      try {
-        sizeBytes = await databaseSize(adapter, engine, signal)
-      } catch {
-        signal?.throwIfAborted()
-        sizeBytes = -1
+      let sizeError = ''
+      if (noDefaultDb) {
+        sizeError = '该连接未设置 database（默认库），库体积不可用。'
+      } else {
+        try {
+          sizeBytes = await databaseSize(adapter, engine, connection.database, signal)
+        } catch (error) {
+          signal?.throwIfAborted()
+          sizeBytes = -1
+          sizeError = error instanceof Error ? error.message : String(error)
+        }
       }
       const tables: Array<Record<string, unknown>> = []
-      if (engine === 'mysql' || engine === 'postgres') {
+      let tablesError = ''
+      if (noDefaultDb) {
+        tablesError = '该连接未设置 database（默认库），表清单不可用。'
+      } else if (engine === 'mysql' || engine === 'postgres') {
         try {
+          // 这里不走 DATABASE()，用连接配置里的库名 —— 语义明确，不依赖会话状态。
           const sql = engine === 'mysql'
-            ? 'SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.tables WHERE TABLE_SCHEMA = DATABASE()'
+            ? "SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.tables WHERE TABLE_SCHEMA = '" + String(connection.database).replace(/'/g, "''") + "'"
             : 'SELECT relname, n_live_tup FROM pg_stat_user_tables ORDER BY relname'
           const result = await adapter.query(sql, undefined, signal)
           for (const row of result.rows) {
@@ -436,7 +473,7 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
           }
         } catch (error) {
           signal?.throwIfAborted()
-          tables.push({ name: '', error: error instanceof Error ? error.message : String(error) })
+          tablesError = error instanceof Error ? error.message : String(error)
         }
       } else {
         const names = await adapter.listTables(signal)
@@ -450,10 +487,7 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
           }
         }
       }
-      // mysql / postgres 分支查 information_schema 失败时会 push 一条 { name: '', error } 占位项，
-      // 它不是一张表，所以这里按名字非空来计数。
-      const tableCount = tables.filter((t) => t.name !== '').length
-      return { connection: name, engine, tableCount, tables, sizeBytes }
+      return { connection: name, engine, tableCount: tables.length, tables, tablesError, sizeBytes, sizeError }
     },
     timeoutMs: STATS_TIMEOUT_MS,
   }
