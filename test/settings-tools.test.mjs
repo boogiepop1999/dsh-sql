@@ -47,7 +47,7 @@ test('sql_settings：空配置正常渲染 + 三条告警', async () => {
   const box = makeSandbox()
   try {
     const value = await box.tool('sql_settings').execute({})
-    assert.match(value.report, /# dsh-sql — 当前环境（未设置），0 \/ 0 个连接/)
+    assert.match(value.report, /# dsh-sql — 当前环境（未设置），0 个可见连接/)
     assert.match(value.report, /environments 为空/)
     assert.match(value.report, /activeEnv 未设置/)
     assert.match(value.report, /还没有任何连接/)
@@ -466,7 +466,7 @@ test('sql_connection_set：env 必须出自 environments', async () => {
   } finally { box.cleanup() }
 })
 
-test('sql_connection_set：env 留空合法（不属于任何环境）', async () => {
+test('sql_connection_set：env 留空合法（不限定环境）', async () => {
   const box = makeSandbox()
   try {
     await box.tool('sql_connection_set').execute(connArgs({ name: 'any' }))
@@ -508,18 +508,38 @@ test('sql_settings：按 activeEnv 筛选，留空的连接哪个环境都列', 
   } finally { box.cleanup() }
 })
 
-test('sql_settings：activeEnv 为空时不筛选，列全部', async () => {
+test('sql_settings：activeEnv 为空时只列不限环境的，带环境的进「其它环境」', async () => {
   const box = makeSandbox()
   try {
     await box.tool('sql_config_set').execute({ environments: ['qa', 'prod'] })
     await box.tool('sql_connection_set').execute(connArgs({ name: 'qa-only', env: 'qa' }))
     await box.tool('sql_connection_set').execute(connArgs({ name: 'prod-only', env: 'prod' }))
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'scratch' }))
 
     const value = await box.tool('sql_settings').execute({})
-    assert.match(value.report, /当前环境（未设置）/)
-    assert.match(value.report, /qa-only/)
-    assert.match(value.report, /prod-only/)
-    assert.doesNotMatch(value.report, /其它环境的连接/)
+    assert.match(value.report, /当前环境（未设置），1 个可见连接/)
+    assert.match(value.report, /## 可见连接（不限环境）/)
+    assert.match(value.report, /scratch/)
+    assert.match(value.report, /其它环境的连接：qa-only、prod-only/)
+    assert.doesNotMatch(value.report, /\| qa-only \|/, '带环境的连接不进可用表')
+    assert.doesNotMatch(value.report, /\| prod-only \|/, '带环境的连接不进可用表')
+  } finally { box.cleanup() }
+})
+
+test('sql_settings：activeEnv 设了环境时，当前环境的 + default 的同列可用', async () => {
+  const box = makeSandbox()
+  try {
+    await box.tool('sql_config_set').execute({ environments: ['qa', 'prod'], activeEnv: 'qa' })
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'qa-only', env: 'qa' }))
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'prod-only', env: 'prod' }))
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'scratch' }))
+
+    const value = await box.tool('sql_settings').execute({})
+    assert.match(value.report, /当前环境 qa，2 个可见连接/)
+    assert.match(value.report, /## 可见连接（当前环境 qa）/)
+    assert.match(value.report, /\| qa-only \|/)
+    assert.match(value.report, /\| scratch \|/, '不限环境的连接在任何环境都可用')
+    assert.match(value.report, /其它环境的连接：prod-only/)
   } finally { box.cleanup() }
 })
 

@@ -19,7 +19,7 @@ export interface SqlConnectionConfig {
   database?: string
   /** 该连接是否禁用写操作（默认 false，即允许写）。 */
   readOnly?: boolean
-  /** 所属环境（如 qa / prod）；留空表示不属于任何环境。 */
+  /** 所属环境（如 qa / prod）；留空表示不限定环境（任何环境都可用）。 */
   env?: string
   /** 连接用途说明（展示用，最长 100 字符）。 */
   description?: string
@@ -67,8 +67,7 @@ export const DESCRIPTION_MAX_LENGTH = 100
 /**
  * 解析设置：**只归一化，不校验**（校验在写入工具里做）。
  * 也**不补任何连接** —— 没配连接就是没有，由 sql_settings 在告警里指出来。
- */
-export function resolveSettings(settings: SqlSettings | undefined | null, env: NodeJS.ProcessEnv = process.env): ResolvedSqlSettings {
+ */export function resolveSettings(settings: SqlSettings | undefined | null, env: NodeJS.ProcessEnv = process.env): ResolvedSqlSettings {
   const cfg = settings ?? {}
   const activeEnv = typeof cfg.activeEnv === 'string' ? cfg.activeEnv.trim() : ''
   const environments = Array.isArray(cfg.environments)
@@ -115,4 +114,27 @@ export function assertIdentifier(name: string, label: string): string {
     throw new Error(label + ' 非法（只允许字母/数字/下划线/美元符）：' + name)
   }
   return trimmed
+}
+
+/**
+ * 按 activeEnv 切分连接：能用的 / 不能用的。
+ *
+ * 匹配规则只有一条：`env` 为空的连接**任何环境都算可用**，否则要求 `env === activeEnv`。
+ * 没匹配上的一律算「其它环境」。
+ *
+ * `activeEnv` 为空时没有连接能靠「环境名相同」匹配，因此只有 `env` 为空的那批可用 —— 与设了环境时同一套规则。
+ */
+export function splitConnectionsByEnv(settings: ResolvedSqlSettings): {
+  available: NamedSqlConnection[]
+  excluded: NamedSqlConnection[]
+} {
+  const { activeEnv, connections } = settings
+  const available: NamedSqlConnection[] = []
+  const excluded: NamedSqlConnection[] = []
+  for (const connection of connections) {
+    if (connection.env === undefined || connection.env === '') available.push(connection)
+    else if (connection.env === activeEnv) available.push(connection)
+    else excluded.push(connection)
+  }
+  return { available, excluded }
 }

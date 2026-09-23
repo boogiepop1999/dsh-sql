@@ -6,7 +6,7 @@
  * @module dsh-sql/tools
  */
 import { createAdapter, type DatabaseAdapter } from './adapters.js'
-import { type ResolvedSqlSettings, type NamedSqlConnection } from './config.js'
+import { type ResolvedSqlSettings, type NamedSqlConnection, splitConnectionsByEnv } from './config.js'
 import {
   asRecord,
   compileParameters,
@@ -302,10 +302,11 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
     return { adapter: adapterFor(connection), name: connection.name, connection }
   }
 
-  /** 逐连接并发探活：串行下 N 个不通要等 N 次超时，并发只等最慢的一个。 */
+  /** 逐连接并发探活：串行下 N 个不通要等 N 次超时，并发只等最慢的一个。只探在 activeEnv 下可见的连接。 */
   const pingAllConnections = async (signal?: AbortSignal): Promise<Array<Record<string, unknown>>> => {
     const cfg = loadConfig()
-    return await Promise.all(cfg.connections.map(async (connection) => {
+    const { available } = splitConnectionsByEnv(cfg)
+    return await Promise.all(available.map(async (connection) => {
       const entry: Record<string, unknown> = { name: connection.name }
       try {
         await adapterFor(connection).ping(signal)
@@ -322,10 +323,10 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
 
   const sqlQuery: SqlToolDefinition = {
     name: 'sql_query',
-    description: '执行只读 SQL 查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。词法级校验会拒绝 data-modifying CTE、SELECT INTO、FOR UPDATE/FOR SHARE、PRAGMA 赋值与多语句。connection 为连接名（必填，用 sql_settings 查看可用连接）。返回列名与行数据，最多 maxRows 行（超出 truncated=true）。写操作请用 sql_exec。',
+    description: '执行只读 SQL 查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。词法级校验会拒绝 data-modifying CTE、SELECT INTO、FOR UPDATE/FOR SHARE、PRAGMA 赋值与多语句。connection 为连接名（必填，用 sql_settings 查看可见连接）。返回列名与行数据，最多 maxRows 行（超出 truncated=true）。写操作请用 sql_exec。',
     parameters: compileParameters({
       sql: { type: 'string', required: true, description: '只读 SQL 语句（必填，单条）。' },
-      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可用连接）。' },
+      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可见连接）。' },
       format: { type: 'string', description: '输出格式：table（默认表格）/ csv / json。csv 与 json 会额外返回 formatted 文本，便于落盘或转存。' },
     }),
     output: {
@@ -377,7 +378,7 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
     description: '执行写操作或 DDL（INSERT / UPDATE / DELETE / CREATE / ALTER / DROP 等，可多语句脚本）。受该连接的 readOnly 开关保护。返回影响行数（多语句时为 0）。',
     parameters: compileParameters({
       sql: { type: 'string', required: true, description: '写操作/DDL SQL（必填）。' },
-      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可用连接）。' },
+      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可见连接）。' },
     }),
     output: {
       schema: execSchema,
@@ -405,7 +406,7 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
     description: '查看数据库结构：不给 table 列出全部表；给 table（表名）返回该表的列信息（名称/类型/非空/主键）。',
     parameters: compileParameters({
       table: { type: 'string', description: '表名（可选；缺省列出全部表）。' },
-      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可用连接）。' },
+      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可见连接）。' },
     }),
     output: {
       schema: schemaToolSchema,
@@ -441,9 +442,9 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
 
   const sqlStats: SqlToolDefinition = {
     name: 'sql_stats',
-    description: '数据库概览统计：表数量、每张表的行数、库体积（SQLite 按页计算，MySQL/PostgreSQL 走系统表）。connection 为连接名（必填，用 sql_settings 查看可用连接）。适合在写查询前先了解数据规模。',
+    description: '数据库概览统计：表数量、每张表的行数、库体积（SQLite 按页计算，MySQL/PostgreSQL 走系统表）。connection 为连接名（必填，用 sql_settings 查看可见连接）。适合在写查询前先了解数据规模。',
     parameters: compileParameters({
-      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可用连接）。' },
+      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可见连接）。' },
     }),
     output: {
       schema: statsSchema,
@@ -504,7 +505,7 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
 
   const sqlHealth: SqlToolDefinition = {
     name: 'sql_health',
-    description: '逐连接做连通性测试（SELECT 1），返回每个连接通不通。连接清单与全局设置请用 sql_settings。',
+    description: '逐连接做连通性测试（SELECT 1），返回每个连接通不通。只探在 activeEnv 下可见的连接（连接清单与全局设置用 sql_settings 看）。',
     parameters: compileParameters({}),
     output: {
       schema: healthSchema,
@@ -512,6 +513,9 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
         const rec = asRecord(value)
         const connections = Array.isArray(rec.connections) ? rec.connections : []
         const bad = connections.filter((c) => asRecord(c).ok !== true)
+        if (connections.length === 0) {
+          return [{ type: 'text', text: 'dsh-sql 探活：activeEnv 下没有可见的连接。用 sql_settings 看配置、sql_connection_set 添加。' }]
+        }
         const lines = ['dsh-sql 探活' + (bad.length === 0 ? '：全部连接正常。' : '：' + bad.length + ' / ' + connections.length + ' 个连接异常。')]
         for (const item of connections) {
           const c = asRecord(item)

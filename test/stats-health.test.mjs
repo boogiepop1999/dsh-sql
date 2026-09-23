@@ -117,3 +117,59 @@ test('sql_health：多连接并发探活，结果按配置顺序返回', async (
   // Windows 上 SQLite 句柄释放有延迟，直接 rm 会偶发 EPERM
   rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
 })
+
+test('sql_health：只探在 activeEnv 下可见的连接', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-ping-env-'))
+  const cfg = resolveSettings({
+    activeEnv: 'qa',
+    environments: ['qa', 'pro'],
+    connections: {
+      'qa-db': { engine: 'sqlite', file: join(dir, 'qa.db'), env: 'qa' },
+      'pro-db': { engine: 'sqlite', file: join(dir, 'pro.db'), env: 'pro' },
+      common: { engine: 'sqlite', file: join(dir, 'common.db') },
+    },
+  })
+  const { tools, adapters } = buildSqlTools(() => cfg)
+  const health = tools.find((t) => t.name === 'sql_health')
+  const value = await health.execute({})
+  assert.deepEqual(
+    value.connections.map((c) => c.name),
+    ['qa-db', 'common'],
+    '当前环境的 + 未标环境的，pro 的排除在外',
+  )
+  assert.equal(value.ok, true)
+  for (const adapter of adapters.values()) await adapter.close()
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+})
+
+test('sql_health：activeEnv 为空时只探不限环境的', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-ping-noenv-'))
+  const cfg = resolveSettings({
+    environments: ['qa', 'pro'],
+    connections: {
+      'qa-db': { engine: 'sqlite', file: join(dir, 'qa.db'), env: 'qa' },
+      'pro-db': { engine: 'sqlite', file: join(dir, 'pro.db'), env: 'pro' },
+      common: { engine: 'sqlite', file: join(dir, 'common.db') },
+    },
+  })
+  const { tools, adapters } = buildSqlTools(() => cfg)
+  const value = await tools.find((t) => t.name === 'sql_health').execute({})
+  assert.deepEqual(value.connections.map((c) => c.name), ['common'], '没设环境 → 只有不限环境的')
+  for (const adapter of adapters.values()) await adapter.close()
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+})
+
+test('sql_health：activeEnv 下没有可见连接时给指引而不是「全部正常」', async () => {
+  const cfg = resolveSettings({
+    activeEnv: 'qa',
+    environments: ['qa', 'pro'],
+    connections: { 'pro-db': { engine: 'sqlite', file: ':memory:', env: 'pro' } },
+  })
+  const { tools } = buildSqlTools(() => cfg)
+  const value = await tools.find((t) => t.name === 'sql_health').execute({})
+  assert.equal(value.ok, true)
+  assert.deepEqual(value.connections, [])
+  const blocks = tools.find((t) => t.name === 'sql_health').output.render({}, value)
+  assert.match(blocks[0].text, /没有可见的连接/)
+  assert.doesNotMatch(blocks[0].text, /全部连接正常/, '0 个连接不该说成全部正常')
+})

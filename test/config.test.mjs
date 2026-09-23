@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { resolveSettings, assertIdentifier, passwordEnvName } from '../lib/index.js'
+import { resolveSettings, assertIdentifier, passwordEnvName, splitConnectionsByEnv } from '../lib/index.js'
 
 /** 解析后的连接按名字取（字典 → 列表，列表元素带 name）。 */
 const byName = (cfg, name) => cfg.connections.find((conn) => conn.name === name)
@@ -116,4 +116,44 @@ test('assertIdentifier 防注入', () => {
   assert.equal(assertIdentifier('users', '表名'), 'users')
   assert.throws(() => assertIdentifier('users; DROP TABLE x', '表名'), /非法/)
   assert.throws(() => assertIdentifier('a b', '表名'), /非法/)
+})
+
+test('splitConnectionsByEnv：当前环境的 + 未标环境的可用，其它环境排除', () => {
+  const cfg = resolveSettings({
+    activeEnv: 'qa',
+    environments: ['qa', 'pro'],
+    connections: {
+      'qa-db': { engine: 'sqlite', env: 'qa' },
+      'pro-db': { engine: 'sqlite', env: 'pro' },
+      common: { engine: 'sqlite' },
+      'blank-env': { engine: 'sqlite', env: '   ' },
+    },
+  })
+  const { available, excluded } = splitConnectionsByEnv(cfg)
+  assert.deepEqual(available.map((c) => c.name), ['qa-db', 'common', 'blank-env'])
+  assert.deepEqual(excluded.map((c) => c.name), ['pro-db'])
+})
+
+test('splitConnectionsByEnv：activeEnv 为空时只有不限环境的可用', () => {
+  const cfg = resolveSettings({
+    environments: ['qa', 'pro'],
+    connections: {
+      'qa-db': { engine: 'sqlite', env: 'qa' },
+      'pro-db': { engine: 'sqlite', env: 'pro' },
+      common: { engine: 'sqlite' },
+    },
+  })
+  const { available, excluded } = splitConnectionsByEnv(cfg)
+  assert.deepEqual(available.map((c) => c.name), ['common'], '没设环境 → 只有不限环境的')
+  assert.deepEqual(excluded.map((c) => c.name), ['qa-db', 'pro-db'], '带环境的一律算其它环境')
+})
+
+test('splitConnectionsByEnv：环境名区分大小写', () => {
+  const cfg = resolveSettings({
+    activeEnv: 'QA',
+    connections: { 'qa-db': { engine: 'sqlite', env: 'qa' } },
+  })
+  const { available, excluded } = splitConnectionsByEnv(cfg)
+  assert.deepEqual(available, [], 'QA ≠ qa')
+  assert.deepEqual(excluded.map((c) => c.name), ['qa-db'])
 })

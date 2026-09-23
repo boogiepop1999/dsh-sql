@@ -31,7 +31,7 @@ $DSH_HOME/sql/settings.json
 
 ```jsonc
 {
-  "activeEnv": "",             // 当前环境；空 = 不按环境筛选
+  "activeEnv": "",             // 当前环境；空 = 只有不限环境的连接可见
   "environments": [],          // 环境清单，如 ["qa", "prod"]
   "connections": {},           // 键即连接名；下面是长成的样子
   "maxRows": 1000,             // 查询返回行数上限（1-10000）
@@ -80,12 +80,16 @@ sql_connection_set({ name: "polar", engine: "mysql", host: "10.0.0.1", database:
 
 ### 环境
 
-**`environments` 是连接的分组标签，`activeEnv` 决定 `sql_settings` 展示哪些连接。**
+**`environments` 是连接的分组标签，`activeEnv` 决定 `sql_settings` 和 `sql_health` 里哪些连接可见。**
+
+匹配规则只有一条：**`env` 为空的连接在任何环境都可见**，否则要求 `env === activeEnv`；没匹配上的一律算「其它环境」。
 
 - `activeEnv` 必须出自 `environments`（两个方向都校验：改当前环境、改清单都会检查）
 - `environments` 传空数组 = 不使用环境，会**连带清空** `activeEnv`
-- 连接的 `env` 必须出自 `environments`；**留空表示不属于任何环境**，这种连接在任何环境下都可见
+- 连接的 `env` 必须出自 `environments`；**留空表示不限定环境**，这种连接在任何环境下都可见
 - 删除某个环境不会拦住你，但会**提示还有哪些连接在用它**
+
+`activeEnv` 为空时没有连接能靠环境名匹配，因此只有不限环境的那批可见 —— 与设了环境时同一套规则。
 
 `activeEnv` 只影响展示，**不影响调用** —— 任何工具都用完整连接名，随时可以跨环境查。
 
@@ -101,7 +105,7 @@ sql_connection_set({ name: "polar", engine: "mysql", host: "10.0.0.1", database:
 | `user` / `password` | mysql / postgres | 密码也可走环境变量 `DSH_SQL_PASSWORD_<连接名大写>` |
 | `database` | postgres **必填**，mysql 可选 | MySQL 不填即不指定默认库，可用 `` `db`.`table` `` 全限定名 |
 | `readOnly` | 全部 | 该连接禁用写操作，缺省 `false` |
-| `env` | 全部 | 所属环境，必须已在 `environments` 里；留空 = 不属于任何环境 |
+| `env` | 全部 | 所属环境，必须已在 `environments` 里；留空 = 不限定环境 |
 | `description` | 全部 | 用途说明，最长 100 字符，在 `sql_settings` 里展示 |
 
 ## 工具
