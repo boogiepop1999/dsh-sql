@@ -65,6 +65,20 @@ test('sql_query 拒绝写语句与多语句', async () => {
   await assert.rejects(() => query.execute({ sql: 'SELECT 1; SELECT 2', connection: 'local' }), /一条语句/)
 })
 
+test('sql_exec 拒绝多语句，且报错说清收到几条、该怎么办', async () => {
+  await assert.rejects(
+    () => exec.execute({ sql: 'CREATE TABLE a (id INTEGER); INSERT INTO a VALUES (1)', connection: 'local' }),
+    (error) => {
+      assert.match(error.message, /一次只能执行一条语句/)
+      assert.match(error.message, /收到 2 条/, '报出实际条数，便于定位')
+      assert.match(error.message, /请拆成多次调用/, '给出可照做的下一步')
+      return true
+    },
+  )
+  // 尾随分号不该被算成第二条
+  await assert.doesNotReject(() => exec.execute({ sql: 'CREATE TABLE b (id INTEGER);', connection: 'local' }))
+})
+
 test('sql_exec 在该连接 readOnly=true 时被禁用', async () => {
   const ro = buildSqlTools(fixed(resolveSettings({ connections: { local: { engine: 'sqlite', file: join(dir, 'app.db'), readOnly: true } } }))).tools
   const roExec = ro.find((t) => t.name === 'sql_exec')

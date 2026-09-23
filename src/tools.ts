@@ -100,6 +100,16 @@ function stripSqlNoise(sql: string): string {
 /** 写操作关键字：出在 SELECT/EXPLAIN/WITH 语句里即拒绝。 */
 const WRITE_KEYWORDS = /\b(insert|update|delete|replace|merge|drop|alter|create|truncate|call|execute|copy|grant|revoke|attach|detach|vacuum|reindex|refresh|set|reset|begin|commit|rollback|savepoint|release|analyze|load_extension)\b/i
 
+/**
+ * 数语句条数（去噪后按分号切）。
+ *
+ * 三个引擎的驱动都不接受多语句，**提前拦下是为了给出「请拆成多次调用」这种能照做的报错**，
+ * 否则 AI 拿到的是驱动的语法错误，会以为 SQL 本身写错了。
+ */
+export function countStatements(sql: string): number {
+  return stripSqlNoise(sql).split(';').filter((part) => part.trim() !== '').length
+}
+
 /** 校验只读查询：词法去噪后白名单开头 + 写关键字扫描 + 单语句。 */
 export function assertReadQuery(sql: string): string {
   const trimmed = sql.trim()
@@ -109,7 +119,7 @@ export function assertReadQuery(sql: string): string {
     throw new Error('sql_query 只接受只读语句（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。写操作请用 sql_exec。')
   }
   const statements = clean.split(';').filter((part) => part.trim() !== '')
-  if (statements.length > 1) throw new Error('sql_query 一次只允许一条语句。')
+  if (statements.length > 1) throw new Error('sql_query 一次只能执行一条语句（收到 ' + String(statements.length) + ' 条）。请拆成多次调用，或用 UNION / 子查询合并成一条。')
   const single = statements[0]?.trim() ?? ''
   if (first === 'pragma') {
     if (/=/.test(single)) throw new Error('sql_query 不接受带赋值参数的 PRAGMA 写操作（如 PRAGMA journal_mode=WAL），请用 sql_exec。')
@@ -326,7 +336,7 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
 
   const sqlQuery: SqlToolDefinition = {
     name: 'sql_query',
-    description: '执行只读 SQL 查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。词法级校验会拒绝 data-modifying CTE、SELECT INTO、FOR UPDATE/FOR SHARE、PRAGMA 赋值与多语句。connection 为连接名（必填，用 sql_settings 查看可见连接）。返回列名与行数据，最多 maxRows 行（超出 truncated=true）。写操作请用 sql_exec。',
+    description: '执行只读 SQL 查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。一次只能一条语句，会做词法校验拦截写操作。connection 为连接名（必填，用 sql_settings 查看可见连接）。',
     parameters: compileParameters({
       sql: { type: 'string', required: true, description: '只读 SQL 语句（必填，单条）。' },
       connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可见连接）。' },
@@ -387,7 +397,7 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
 
   const sqlExec: SqlToolDefinition = {
     name: 'sql_exec',
-    description: '执行写操作或 DDL（INSERT / UPDATE / DELETE / CREATE / ALTER / DROP 等，可多语句脚本）。受该连接的 readOnly 开关保护。返回影响行数（多语句时为 0）。',
+    description: '执行写操作或 DDL（INSERT / UPDATE / DELETE / CREATE / ALTER / DROP 等）。一次只能一条语句。受该连接的 readOnly 开关保护，返回影响行数。',
     parameters: compileParameters({
       sql: { type: 'string', required: true, description: '写操作/DDL SQL（必填）。' },
       connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可见连接）。' },
@@ -402,6 +412,12 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
     async execute(rawArgs: unknown, exec: unknown) {
       const args = asRecord(rawArgs)
       const sql = requiredString(args, 'sql', 'SQL 语句')
+      // 驱动层本就不接受多语句。提前拦下是为了给出「请拆成多次调用」这种能照做的报错，
+      // 否则 AI 拿到的是驱动的语法错误，会以为 SQL 本身写错了。
+      const count = countStatements(sql)
+      if (count > 1) {
+        throw new Error('sql_exec 一次只能执行一条语句（收到 ' + String(count) + ' 条）。请拆成多次调用。')
+      }
       // 先解析定义并判 readOnly，再建适配器 —— 只读连接不该被建出一个用不上的连接池。
       const connection = resolveConnection(optionalString(args, 'connection'))
       if (connection.readOnly === true) {
