@@ -73,7 +73,7 @@ export function buildSettingsTools(): SqlToolDefinition[] {
     name: 'sql_settings',
     description:
       '总览：连接名清单 + 全局设置。\n' +
-      '报告是现成的 Markdown，**汇报时原样贴出**，别改写别压缩。',
+      '报告是现成的 Markdown，**汇报时原样贴出**，别改写别压缩。配置文件改动立即生效，不用重启。',
     parameters: compileParameters({}),
     output: {
       schema: {
@@ -155,7 +155,7 @@ export function buildSettingsTools(): SqlToolDefinition[] {
   const sqlConfigSet: SqlToolDefinition = {
     name: 'sql_config_set',
     description:
-      '改全局设置：activeEnv / environments / maxRows，至少一个入参。先 sql_settings 看现值。立即生效，不用重启。\n' +
+      '改全局设置，参数至少一个，先 sql_settings 看现值。\n' +
       CONFIG_WRITE_WARNING,
     parameters: compileParameters({
       activeEnv: { type: 'string', description: '当前环境名。传空串表示不设置环境。' },
@@ -260,7 +260,7 @@ export function buildSettingsTools(): SqlToolDefinition[] {
   const sqlConnectionSet: SqlToolDefinition = {
     name: 'sql_connection_set',
     description:
-      '新增或覆盖一个连接。**未给的字段保持不变；给了就设为该值**。先 sql_settings 看现值。立即生效，不用重启。\n' +
+      '新增或覆盖一个连接。**未给的字段保持不变；给了就设为该值**。先 sql_settings 看现值。\n' +
       CONFIG_WRITE_WARNING,
     parameters: compileParameters({
       name: { type: 'string', required: true, description: '连接名。' },
@@ -394,7 +394,7 @@ export function buildSettingsTools(): SqlToolDefinition[] {
   const sqlConnectionRemove: SqlToolDefinition = {
     name: 'sql_connection_remove',
     description:
-      '删除一个连接（连带关闭它的连接池）。先 sql_settings 看现值。立即生效，不用重启。\n' + CONFIG_WRITE_WARNING,
+      '删除一个连接（连带关闭它的连接池）。\n' + CONFIG_WRITE_WARNING,
     parameters: compileParameters({
       name: { type: 'string', required: true, description: '连接名。' },
     }),
