@@ -24,9 +24,14 @@ export interface SqlToolDefinition {
   timeoutMs?: number
 }
 
-/** 参数字段简表的一项。 */
+/**
+ * 参数字段简表的一项。
+ *
+ * `type` 支持类型数组（如 `['string', 'null']`）—— 部分更新语义要靠 `null` 表达「清空」，
+ * 单类型声明会让模型看不到这个选项。注意别写成空数组（会被丢弃，等于没声明类型）。
+ */
 export interface ParameterSpec {
-  type?: string
+  type?: string | string[]
   required?: boolean
   description?: string
 }
@@ -39,6 +44,7 @@ export function compileParameters(spec: Record<string, ParameterSpec>): { type: 
     if (prop?.required === true) required.push(key)
     const node: Record<string, unknown> = {}
     if (typeof prop?.type === 'string') node.type = prop.type
+    else if (Array.isArray(prop?.type) && prop.type.length > 0) node.type = prop.type
     if (typeof prop?.description === 'string') node.description = prop.description
     properties[key] = node
   }

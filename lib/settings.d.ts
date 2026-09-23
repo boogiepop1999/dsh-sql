@@ -9,7 +9,12 @@ export declare function pluginDataDir(env?: NodeJS.ProcessEnv): string;
 export declare function settingsFile(env?: NodeJS.ProcessEnv): string;
 /** 原子写 JSON：先写临时文件再 rename，避免留下半截文件。 */
 export declare function writeJsonAtomic(file: string, value: unknown): void;
-/** 规范化设置：只保留已知字段，并交给 `resolveSettings` 做权威校验（失败即抛，不写盘）。 */
+/**
+ * 规范化设置：只保留已知字段。
+ *
+ * 返回的是**剔除未知字段后的原值**，不是 `resolveSettings` 的结果 —— 后者会给缺省字段
+ * 兜底（file 补 `:memory:` 等），拿它写盘会让「显式清空某字段」失效。
+ */
 export declare function normalizeSettings(raw: unknown): SqlSettings;
 /** 出厂设置：字段按 `SqlSettings` 最新定义**全部显式写出**，作为可直接照改的样例。 */
 export declare function defaultSettings(): SqlSettings;

@@ -6,7 +6,7 @@
  * @module dsh-sql/tools
  */
 import { createAdapter, type DatabaseAdapter } from './adapters.js'
-import { type ResolvedSqlSettings, type SqlConnectionConfig } from './config.js'
+import { type ResolvedSqlSettings, type NamedSqlConnection } from './config.js'
 import {
   asRecord,
   compileParameters,
@@ -243,7 +243,7 @@ interface CachedAdapter {
 }
 
 /** 连接定义指纹：任一影响连接身份的字段变了，缓存就必须失效。 */
-function connectionFingerprint(connection: SqlConnectionConfig): string {
+function connectionFingerprint(connection: NamedSqlConnection): string {
   return [
     connection.engine,
     connection.host,
@@ -268,13 +268,13 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
   /** 对外暴露的适配器视图（供 dispose 关闭）。 */
   const adapters = new Map<string, DatabaseAdapter>()
 
-  /** 解析连接名 → 连接定义（不建适配器）。 */
-  const resolveConnection = (name: string | undefined): SqlConnectionConfig => {
+  /** 解析连接名 → 连接定义（不建适配器）。名字区分大小写。 */
+  const resolveConnection = (name: string | undefined): NamedSqlConnection => {
     if (name === undefined) {
       throw new Error('必须显式指定 connection 参数（不再有默认连接）。可用 sql_settings 查看连接清单。')
     }
     const cfg = loadConfig()
-    const connection = cfg.connections.find((item) => item.name.toLowerCase() === name.toLowerCase())
+    const connection = cfg.connections.find((item) => item.name === name)
     if (connection === undefined) {
       throw new Error('未找到名为 ' + name + ' 的数据库连接。可用 sql_settings 查看连接清单。')
     }
@@ -282,7 +282,7 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
   }
 
   /** 连接定义 → 适配器（惰性创建；定义变了则关掉旧的、重建）。 */
-  const adapterFor = (connection: SqlConnectionConfig): DatabaseAdapter => {
+  const adapterFor = (connection: NamedSqlConnection): DatabaseAdapter => {
     const fingerprint = connectionFingerprint(connection)
     const cached = cache.get(connection.name)
     if (cached !== undefined) {
@@ -297,7 +297,7 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
     return adapter
   }
 
-  const getAdapter = (name: string | undefined): { adapter: DatabaseAdapter; name: string; connection: SqlConnectionConfig } => {
+  const getAdapter = (name: string | undefined): { adapter: DatabaseAdapter; name: string; connection: NamedSqlConnection } => {
     const connection = resolveConnection(name)
     return { adapter: adapterFor(connection), name: connection.name, connection }
   }

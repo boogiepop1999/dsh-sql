@@ -41,31 +41,41 @@ export function writeJsonAtomic(file: string, value: unknown): void {
   renameSync(tmp, file)
 }
 
-/** 规范化设置：只保留已知字段，并交给 `resolveSettings` 做权威校验（失败即抛，不写盘）。 */
+/**
+ * 规范化设置：只保留已知字段。
+ *
+ * 返回的是**剔除未知字段后的原值**，不是 `resolveSettings` 的结果 —— 后者会给缺省字段
+ * 兜底（file 补 `:memory:` 等），拿它写盘会让「显式清空某字段」失效。
+ */
 export function normalizeSettings(raw: unknown): SqlSettings {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     throw new Error(SETTINGS_FILE_NAME + ' 顶层必须是一个对象。')
   }
   const source = raw as Record<string, unknown>
   const out: SqlSettings = {}
+  if (source.activeEnv !== undefined) out.activeEnv = source.activeEnv as string
+  if (source.environments !== undefined) {
+    if (!Array.isArray(source.environments)) throw new Error('environments 必须是一个数组。')
+    out.environments = source.environments as string[]
+  }
   if (source.connections !== undefined) {
-    if (!Array.isArray(source.connections)) throw new Error('connections 必须是一个数组。')
-    out.connections = source.connections as SqlConnectionConfig[]
+    if (typeof source.connections !== 'object' || source.connections === null || Array.isArray(source.connections)) {
+      throw new Error('connections 必须是一个对象（键即连接名）。')
+    }
+    out.connections = source.connections as Record<string, SqlConnectionConfig>
   }
   for (const key of ['maxRows', 'queryTimeoutMs', 'execTimeoutMs'] as const) {
     if (source[key] !== undefined) out[key] = source[key] as number
   }
-  // 交给 config.ts 做权威校验；只在通过后才允许写盘。
-  resolveSettings(out)
   return out
 }
 
 /** 出厂设置：字段按 `SqlSettings` 最新定义**全部显式写出**，作为可直接照改的样例。 */
 export function defaultSettings(): SqlSettings {
   return {
-    connections: [
-      { name: 'default', engine: 'sqlite', file: ':memory:', readOnly: false },
-    ],
+    activeEnv: '',
+    environments: [],
+    connections: {},
     maxRows: 1000,
     queryTimeoutMs: 60000,
     execTimeoutMs: 120000,

@@ -25,9 +25,14 @@ export interface SqlToolDefinition {
     execute(args: unknown, exec: unknown): Promise<unknown>;
     timeoutMs?: number;
 }
-/** 参数字段简表的一项。 */
+/**
+ * 参数字段简表的一项。
+ *
+ * `type` 支持类型数组（如 `['string', 'null']`）—— 部分更新语义要靠 `null` 表达「清空」，
+ * 单类型声明会让模型看不到这个选项。注意别写成空数组（会被丢弃，等于没声明类型）。
+ */
 export interface ParameterSpec {
-    type?: string;
+    type?: string | string[];
     required?: boolean;
     description?: string;
 }

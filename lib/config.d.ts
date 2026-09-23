@@ -3,9 +3,12 @@
  *
  * @module dsh-sql/config
  */
-/** 单个数据库连接。 */
+/**
+ * 单个数据库连接的参数。
+ *
+ * **不含 name** —— 名字是 connections 字典的键（见 `SqlSettings`）。
+ */
 export interface SqlConnectionConfig {
-    name: string;
     engine: 'sqlite' | 'mysql' | 'postgres';
     file?: string;
     host?: string;
@@ -15,19 +18,33 @@ export interface SqlConnectionConfig {
     database?: string;
     /** 该连接是否禁用写操作（默认 false，即允许写）。 */
     readOnly?: boolean;
+    /** 所属环境（如 qa / prod）；留空表示不属于任何环境。 */
+    env?: string;
     /** 连接用途说明（展示用，最长 100 字符）。 */
     description?: string;
 }
+/** 具名连接：名字 + 参数。 */
+export interface NamedSqlConnection extends SqlConnectionConfig {
+    name: string;
+}
 /** 设置文件的形状。 */
 export interface SqlSettings {
-    connections?: SqlConnectionConfig[];
+    /** 当前环境名；空串 = 未设置。必须在 environments 里。 */
+    activeEnv?: string;
+    /** 环境清单（去重、非空字符串）。 */
+    environments?: string[];
+    /** 连接表：键即连接名（区分大小写）。 */
+    connections?: Record<string, SqlConnectionConfig>;
     maxRows?: number;
     queryTimeoutMs?: number;
     execTimeoutMs?: number;
 }
 /** 解析后的设置。 */
 export interface ResolvedSqlSettings {
-    connections: SqlConnectionConfig[];
+    activeEnv: string;
+    environments: string[];
+    /** 连接列表（已把键还原成 name，便于按顺序渲染）。 */
+    connections: NamedSqlConnection[];
     maxRows: number;
     queryTimeoutMs: number;
     execTimeoutMs: number;
@@ -37,7 +54,8 @@ export declare function passwordEnvName(name: string): string;
 /** description 字段最大长度，超出截断。 */
 export declare const DESCRIPTION_MAX_LENGTH = 100;
 /**
- * 解析并校验设置；无连接时给一个内存 SQLite 兜底连接。
+ * 解析设置：**只归一化，不校验**（校验在写入工具里做）。
+ * 也**不补任何连接** —— 没配连接就是没有，由 sql_settings 在告警里指出来。
  */
 export declare function resolveSettings(settings: SqlSettings | undefined | null, env?: NodeJS.ProcessEnv): ResolvedSqlSettings;
 /** 校验表名/标识符，防注入到 schema 语句。 */

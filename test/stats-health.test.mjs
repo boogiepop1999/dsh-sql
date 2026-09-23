@@ -7,7 +7,7 @@ import { buildSqlTools, resolveSettings, toCsv } from '../lib/index.js'
 
 function makeTools() {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-stats-'))
-  const cfg = resolveSettings({ connections: [{ name: 'local', engine: 'sqlite', file: join(dir, 'stats.db') }], maxRows: 100 })
+  const cfg = resolveSettings({ connections: { local: { engine: 'sqlite', file: join(dir, 'stats.db') } }, maxRows: 100 })
   const { tools } = buildSqlTools(() => cfg)
   const exec = tools.find((t) => t.name === 'sql_exec')
   return { tools, exec }
@@ -86,7 +86,7 @@ test('sql_health：只探活，不含全局设置', async () => {
 })
 
 test('sql_health：坏连接报 ok=false 且错误可读', async () => {
-  const cfg = resolveSettings({ connections: [{ name: 'bad', engine: 'mysql', host: '127.0.0.1', port: 1, database: 'x', user: 'u', password: 'p' }], maxRows: 10, queryTimeoutMs: 5000, execTimeoutMs: 5000 })
+  const cfg = resolveSettings({ connections: { bad: { engine: 'mysql', host: '127.0.0.1', port: 1, database: 'x', user: 'u', password: 'p' } }, maxRows: 10, queryTimeoutMs: 5000, execTimeoutMs: 5000 })
   const { tools } = buildSqlTools(() => cfg)
   const health = tools.find((t) => t.name === 'sql_health')
   const value = await health.execute({})
@@ -98,11 +98,11 @@ test('sql_health：坏连接报 ok=false 且错误可读', async () => {
 test('sql_health：多连接并发探活，结果按配置顺序返回', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-ping-'))
   const cfg = resolveSettings({
-    connections: [
-      { name: 'a', engine: 'sqlite', file: join(dir, 'a.db') },
-      { name: 'b', engine: 'sqlite', file: join(dir, 'b.db') },
-      { name: 'c', engine: 'sqlite', file: join(dir, 'c.db') },
-    ],
+    connections: {
+      a: { engine: 'sqlite', file: join(dir, 'a.db') },
+      b: { engine: 'sqlite', file: join(dir, 'b.db') },
+      c: { engine: 'sqlite', file: join(dir, 'c.db') },
+    },
   })
   const { tools, adapters } = buildSqlTools(() => cfg)
   const health = tools.find((t) => t.name === 'sql_health')

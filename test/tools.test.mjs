@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { buildSqlTools, resolveSettings, assertReadQuery } from '../lib/index.js'
 
 const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-tools-'))
-const cfg = resolveSettings({ connections: [{ name: 'local', engine: 'sqlite', file: join(dir, 'app.db') }], maxRows: 2 })
+const cfg = resolveSettings({ connections: { local: { engine: 'sqlite', file: join(dir, 'app.db') } }, maxRows: 2 })
 const fixed = (config) => () => config
 const { tools, adapters } = buildSqlTools(fixed(cfg))
 const query = tools.find((t) => t.name === 'sql_query')
@@ -66,7 +66,7 @@ test('sql_query 拒绝写语句与多语句', async () => {
 })
 
 test('sql_exec 在该连接 readOnly=true 时被禁用', async () => {
-  const ro = buildSqlTools(fixed(resolveSettings({ connections: [{ ...cfg.connections[0], readOnly: true }] }))).tools
+  const ro = buildSqlTools(fixed(resolveSettings({ connections: { local: { engine: 'sqlite', file: join(dir, 'app.db'), readOnly: true } } }))).tools
   const roExec = ro.find((t) => t.name === 'sql_exec')
   await assert.rejects(
     () => roExec.execute({ sql: 'INSERT INTO items (label) VALUES (\'x\')', connection: 'local' }),
@@ -77,10 +77,10 @@ test('sql_exec 在该连接 readOnly=true 时被禁用', async () => {
 test('连接级 readOnly 只影响该连接，其他连接仍可写', async () => {
   const dir2 = mkdtempSync(join(tmpdir(), 'dsh-sql-rw-'))
   const multi = resolveSettings({
-    connections: [
-      { name: 'locked', engine: 'sqlite', file: join(dir2, 'a.db'), readOnly: true },
-      { name: 'open', engine: 'sqlite', file: join(dir2, 'b.db') },
-    ],
+    connections: {
+      locked: { engine: 'sqlite', file: join(dir2, 'a.db'), readOnly: true },
+      open: { engine: 'sqlite', file: join(dir2, 'b.db') },
+    },
   })
   const { tools: multiTools, adapters: multiAdapters } = buildSqlTools(fixed(multi))
   const multiExec = multiTools.find((t) => t.name === 'sql_exec')

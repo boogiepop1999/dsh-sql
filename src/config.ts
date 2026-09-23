@@ -4,9 +4,12 @@
  * @module dsh-sql/config
  */
 
-/** 单个数据库连接。 */
+/**
+ * 单个数据库连接的参数。
+ *
+ * **不含 name** —— 名字是 connections 字典的键（见 `SqlSettings`）。
+ */
 export interface SqlConnectionConfig {
-  name: string
   engine: 'sqlite' | 'mysql' | 'postgres'
   file?: string
   host?: string
@@ -16,13 +19,25 @@ export interface SqlConnectionConfig {
   database?: string
   /** 该连接是否禁用写操作（默认 false，即允许写）。 */
   readOnly?: boolean
+  /** 所属环境（如 qa / prod）；留空表示不属于任何环境。 */
+  env?: string
   /** 连接用途说明（展示用，最长 100 字符）。 */
   description?: string
 }
 
+/** 具名连接：名字 + 参数。 */
+export interface NamedSqlConnection extends SqlConnectionConfig {
+  name: string
+}
+
 /** 设置文件的形状。 */
 export interface SqlSettings {
-  connections?: SqlConnectionConfig[]
+  /** 当前环境名；空串 = 未设置。必须在 environments 里。 */
+  activeEnv?: string
+  /** 环境清单（去重、非空字符串）。 */
+  environments?: string[]
+  /** 连接表：键即连接名（区分大小写）。 */
+  connections?: Record<string, SqlConnectionConfig>
   maxRows?: number
   queryTimeoutMs?: number
   execTimeoutMs?: number
@@ -30,7 +45,10 @@ export interface SqlSettings {
 
 /** 解析后的设置。 */
 export interface ResolvedSqlSettings {
-  connections: SqlConnectionConfig[]
+  activeEnv: string
+  environments: string[]
+  /** 连接列表（已把键还原成 name，便于按顺序渲染）。 */
+  connections: NamedSqlConnection[]
   maxRows: number
   queryTimeoutMs: number
   execTimeoutMs: number
@@ -47,25 +65,27 @@ export function passwordEnvName(name: string): string {
 export const DESCRIPTION_MAX_LENGTH = 100
 
 /**
- * 解析并校验设置；无连接时给一个内存 SQLite 兜底连接。
+ * 解析设置：**只归一化，不校验**（校验在写入工具里做）。
+ * 也**不补任何连接** —— 没配连接就是没有，由 sql_settings 在告警里指出来。
  */
 export function resolveSettings(settings: SqlSettings | undefined | null, env: NodeJS.ProcessEnv = process.env): ResolvedSqlSettings {
   const cfg = settings ?? {}
-  const rawConnections = Array.isArray(cfg.connections) ? cfg.connections : []
-  const connections: SqlConnectionConfig[] = []
-  const seen = new Set<string>()
-  for (const raw of rawConnections) {
+  const activeEnv = typeof cfg.activeEnv === 'string' ? cfg.activeEnv.trim() : ''
+  const environments = Array.isArray(cfg.environments)
+    ? [...new Set(cfg.environments.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter((item) => item !== ''))]
+    : []
+  const rawConnections = typeof cfg.connections === 'object' && cfg.connections !== null && !Array.isArray(cfg.connections)
+    ? cfg.connections
+    : {}
+  const connections: NamedSqlConnection[] = []
+  for (const [name, raw] of Object.entries(rawConnections)) {
     if (typeof raw !== 'object' || raw === null) continue
-    const name = typeof raw.name === 'string' ? raw.name.trim() : ''
-    if (name === '') throw new Error('connections 里每个连接都需要 name 字段。')
-    if (seen.has(name.toLowerCase())) throw new Error('连接名重复：' + name + '。')
-    seen.add(name.toLowerCase())
     const engine = raw.engine as (typeof ENGINES)[number] | undefined
-    if (!ENGINES.includes(engine as (typeof ENGINES)[number])) throw new Error('连接 ' + name + ' 的 engine 必须是 sqlite / mysql / postgres 之一。')
-    const connection: SqlConnectionConfig = { name, engine: engine as (typeof ENGINES)[number] }
+    const connection: NamedSqlConnection = { name, engine: engine as (typeof ENGINES)[number] }
     connection.readOnly = raw.readOnly === true
+    if (typeof raw.env === 'string' && raw.env.trim() !== '') connection.env = raw.env.trim()
     if (typeof raw.description === 'string' && raw.description.trim() !== '') {
-      connection.description = raw.description.trim().slice(0, DESCRIPTION_MAX_LENGTH)
+      connection.description = raw.description.trim()
     }
     if (connection.engine === 'sqlite') {
       connection.file = typeof raw.file === 'string' && raw.file.trim() !== '' ? raw.file.trim() : ':memory:'
@@ -76,32 +96,16 @@ export function resolveSettings(settings: SqlSettings | undefined | null, env: N
       connection.database = typeof raw.database === 'string' ? raw.database.trim() : ''
       const direct = typeof raw.password === 'string' ? raw.password.trim() : ''
       connection.password = direct !== '' ? direct : (env[passwordEnvName(name)]?.trim() ?? '')
-      // PostgreSQL 必须指定库；MySQL 的 database 可选（不填即不指定默认库，可用全限定名查询）。
-      if (connection.engine === 'postgres' && connection.database === '') {
-        throw new Error('连接 ' + name + '（postgres）缺少 database 字段。')
-      }
     }
     connections.push(connection)
   }
-  if (connections.length === 0) {
-    connections.push({ name: 'default', engine: 'sqlite', file: ':memory:', readOnly: false })
-  }
   let maxRows = 1000
-  if (cfg.maxRows !== undefined) {
-    if (typeof cfg.maxRows !== 'number' || !Number.isInteger(cfg.maxRows) || cfg.maxRows <= 0) throw new Error('maxRows 必须是大于 0 的整数。')
-    maxRows = Math.min(10000, cfg.maxRows)
-  }
+  if (cfg.maxRows !== undefined) maxRows = Math.min(10000, Math.max(1, Math.round(cfg.maxRows)))
   let queryTimeoutMs = 60000
-  if (cfg.queryTimeoutMs !== undefined) {
-    if (typeof cfg.queryTimeoutMs !== 'number' || !Number.isFinite(cfg.queryTimeoutMs) || cfg.queryTimeoutMs <= 0) throw new Error('queryTimeoutMs 必须是大于 0 的数字（毫秒）。')
-    queryTimeoutMs = Math.min(600000, Math.max(5000, Math.round(cfg.queryTimeoutMs)))
-  }
+  if (cfg.queryTimeoutMs !== undefined) queryTimeoutMs = Math.min(600000, Math.max(5000, Math.round(cfg.queryTimeoutMs)))
   let execTimeoutMs = 120000
-  if (cfg.execTimeoutMs !== undefined) {
-    if (typeof cfg.execTimeoutMs !== 'number' || !Number.isFinite(cfg.execTimeoutMs) || cfg.execTimeoutMs <= 0) throw new Error('execTimeoutMs 必须是大于 0 的数字（毫秒）。')
-    execTimeoutMs = Math.min(600000, Math.max(5000, Math.round(cfg.execTimeoutMs)))
-  }
-  return { connections, maxRows, queryTimeoutMs, execTimeoutMs }
+  if (cfg.execTimeoutMs !== undefined) execTimeoutMs = Math.min(600000, Math.max(5000, Math.round(cfg.execTimeoutMs)))
+  return { activeEnv, environments, connections, maxRows, queryTimeoutMs, execTimeoutMs }
 }
 
 /** 校验表名/标识符，防注入到 schema 语句。 */
