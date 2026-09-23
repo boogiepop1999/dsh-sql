@@ -67,7 +67,7 @@ export declare const EXEC_TIMEOUT_MS = 30000;
 export declare const STATS_TIMEOUT_MS = 120000;
 /** 连接密码环境变量名：DSH_SQL_PASSWORD_<NAME 大写>。 */
 export declare function passwordEnvName(name: string): string;
-/** description 字段最大长度，超出截断。 */
+/** description 字段最大长度；超长由 sql_connection_set 报错拦下（读取侧不校验也不截断）。 */
 export declare const DESCRIPTION_MAX_LENGTH = 100;
 /**
  * 解析设置：**只归一化，不校验**（校验在写入工具里做）。

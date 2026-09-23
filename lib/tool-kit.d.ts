@@ -25,14 +25,9 @@ export interface SqlToolDefinition {
     execute(args: unknown, exec: unknown): Promise<unknown>;
     timeoutMs?: number;
 }
-/**
- * 参数字段简表的一项。
- *
- * `type` 支持类型数组（如 `['string', 'null']`）—— 部分更新语义要靠 `null` 表达「清空」，
- * 单类型声明会让模型看不到这个选项。注意别写成空数组（会被丢弃，等于没声明类型）。
- */
+/** 参数字段简表的一项。 */
 export interface ParameterSpec {
-    type?: string | string[];
+    type?: string;
     required?: boolean;
     description?: string;
 }
@@ -68,8 +63,7 @@ export declare const CONFIG_WRITE_WARNING = "\u26A0 **\u4EC5\u5F53\u7528\u6237\u
 /** 判断一个错误是否是中止（超时 / 取消）导致的。 */
 export declare function isAbortError(error: unknown): boolean;
 /**
- * 查询超时的提示：读操作重试**不会造成破坏**，但也不能一直试 ——
- * 超时说明语句本身太重，撞几次就该停下来找人确认。
+ * 查询超时的提示：点明这是工具护栏（不是环境不稳），并给出「可有限重试」的边界。
  *
  * 只指出问题与边界，**不给具体手段** —— 列一堆招法反而会把思路钉死。
  */

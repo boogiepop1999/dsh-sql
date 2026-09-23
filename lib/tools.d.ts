@@ -8,12 +8,7 @@
 import { type DatabaseAdapter } from './adapters.js';
 import { type ResolvedSqlSettings } from './config.js';
 import { type SqlToolDefinition } from './tool-kit.js';
-/**
- * 数语句条数（去噪后按分号切）。
- *
- * 三个引擎的驱动都不接受多语句，**提前拦下是为了给出「请拆成多次调用」这种能照做的报错**，
- * 否则 AI 拿到的是驱动的语法错误，会以为 SQL 本身写错了。
- */
+/** 数语句条数 —— 供 sql_exec 判断是否多语句。 */
 export declare function countStatements(sql: string): number;
 /** 校验只读查询：词法去噪后白名单开头 + 写关键字扫描 + 单语句。 */
 export declare function assertReadQuery(sql: string): string;

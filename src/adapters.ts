@@ -204,10 +204,11 @@ class SqliteAdapter implements DatabaseAdapter {
   async exec(sql: string, signal?: AbortSignal) {
     signal?.throwIfAborted()
     const single = sql.replace(/;\s*$/, '').trim()
+    // 多语句必须拦下：node:sqlite 的 prepare().run() 遇到多语句**不报错、静默只执行第一条**，
+    // 后面的语句会被无声丢弃。工具的 sql_exec 已拦一道，这里兜住直接调用适配器的场景。
+    // 与 mysql / postgres 行为一致（那两个由驱动报错）。
     if (single.includes(';')) {
-      this.db.exec(sql)
-      signal?.throwIfAborted()
-      return 0
+      throw new Error('SQLite 一次只能执行一条语句。请拆成多次调用。')
     }
     const result = this.db.prepare(single).run()
     signal?.throwIfAborted()

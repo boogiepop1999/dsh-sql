@@ -80,7 +80,7 @@ export function passwordEnvName(name: string): string {
   return 'DSH_SQL_PASSWORD_' + name.toUpperCase().replace(/[^A-Z0-9_]/g, '_')
 }
 
-/** description 字段最大长度，超出截断。 */
+/** description 字段最大长度；超长由 sql_connection_set 报错拦下（读取侧不校验也不截断）。 */
 export const DESCRIPTION_MAX_LENGTH = 100
 
 /**

@@ -44,8 +44,8 @@ export function writeJsonAtomic(file: string, value: unknown): void {
 /**
  * 规范化设置：只保留已知字段。
  *
- * 返回的是**剔除未知字段后的原值**，不是 `resolveSettings` 的结果 —— 后者会给缺省字段
- * 兜底（file 补 `:memory:` 等），拿它写盘会让「显式清空某字段」失效。
+ * 返回的是**剔除未知字段后的原值**，不是 `resolveSettings` 的结果 —— 后者会把字段
+ * 归一化（trim、类型过滤），拿它写盘会让「不传=不动」的部分更新语义失真。
  */
 export function normalizeSettings(raw: unknown): SqlSettings {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
@@ -81,7 +81,7 @@ export function defaultSettings(): SqlSettings {
 /** 读设置的结果。 */
 export interface LoadedSettings {
   settings: SqlSettings
-  /** 解析后的权威设置（含兜底连接与钳制后的数值）。 */
+  /** 解析后的权威设置（归一化后的连接列表与钳制后的数值）。 */
   resolved: ResolvedSqlSettings
   file: string
   /** 本次调用是否新建了文件（首次生成出厂设置）。 */

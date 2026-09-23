@@ -25,11 +25,14 @@ test('SQLite：建表/插入/查询/描述/列表', async () => {
   assert.equal(columns[1].notNull, true)
 })
 
-test('SQLite：exec 返回 changes，多语句返回 0', async () => {
+test('SQLite：exec 返回 changes；多语句拦下（不静默丢语句）', async () => {
   const changes = await adapter.exec('UPDATE users SET score = 100 WHERE name = \'张三\'')
   assert.equal(changes, 1)
-  const multi = await adapter.exec('CREATE TABLE a (x INTEGER); CREATE TABLE b (y INTEGER)')
-  assert.equal(multi, 0)
+  // node:sqlite 的 prepare().run() 遇多语句不报错、只执行第一条 —— 必须自己拦，否则后续语句被无声丢弃。
+  await assert.rejects(
+    () => adapter.exec('CREATE TABLE a (x INTEGER); CREATE TABLE b (y INTEGER)'),
+    /一次只能执行一条语句/,
+  )
 })
 
 test('SQLite：query(limit) 只迭代前 N 行，不全量载入', async () => {

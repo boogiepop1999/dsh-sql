@@ -103,8 +103,14 @@ const WRITE_KEYWORDS = /\b(insert|update|delete|replace|merge|drop|alter|create|
  * 三个引擎的驱动都不接受多语句，**提前拦下是为了给出「请拆成多次调用」这种能照做的报错**，
  * 否则 AI 拿到的是驱动的语法错误，会以为 SQL 本身写错了。
  */
+/** 去噪后按分号切出非空语句（`countStatements` 与 `assertReadQuery` 共用这一份拆分规则）。 */
+function splitStatements(sql: string): string[] {
+  return stripSqlNoise(sql).split(';').filter((part) => part.trim() !== '')
+}
+
+/** 数语句条数 —— 供 sql_exec 判断是否多语句。 */
 export function countStatements(sql: string): number {
-  return stripSqlNoise(sql).split(';').filter((part) => part.trim() !== '').length
+  return splitStatements(sql).length
 }
 
 /** 校验只读查询：词法去噪后白名单开头 + 写关键字扫描 + 单语句。 */
@@ -115,7 +121,7 @@ export function assertReadQuery(sql: string): string {
   if (!READ_KEYWORDS.test(clean.trim())) {
     throw new Error('sql_query 只接受只读语句（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。写操作请用 sql_exec。')
   }
-  const statements = clean.split(';').filter((part) => part.trim() !== '')
+  const statements = splitStatements(trimmed)
   if (statements.length > 1) throw new Error('sql_query 一次只能执行一条语句（收到 ' + String(statements.length) + ' 条）。请拆成多次调用，或用 UNION / 子查询合并成一条。')
   const single = statements[0]?.trim() ?? ''
   if (first === 'pragma') {
@@ -531,7 +537,10 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
           }
         }
       }
-      return { connection: name, engine, tableCount: tables.filter((t) => t.name !== '').length, tables, sizeBytes }
+      // mysql / postgres 分支查 information_schema 失败时会 push 一条 { name: '', error } 占位项，
+      // 它不是一张表，所以这里按名字非空来计数。
+      const tableCount = tables.filter((t) => t.name !== '').length
+      return { connection: name, engine, tableCount, tables, sizeBytes }
     },
     timeoutMs: STATS_TIMEOUT_MS,
   }
