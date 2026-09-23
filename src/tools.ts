@@ -16,11 +16,8 @@ import {
   optionalString,
   queryTimeoutError,
   requiredString,
-  type ContentBlock,
   type SqlToolDefinition,
 } from './tool-kit.js'
-
-export type { ContentBlock, SqlToolDefinition } from './tool-kit.js'
 
 /** 只读语句关键字白名单。 */
 const READ_KEYWORDS = /^(select|pragma|explain|show|describe|desc|with)\b/i

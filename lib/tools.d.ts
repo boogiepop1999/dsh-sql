@@ -8,7 +8,6 @@
 import { type DatabaseAdapter } from './adapters.js';
 import { type ResolvedSqlSettings } from './config.js';
 import { type SqlToolDefinition } from './tool-kit.js';
-export type { ContentBlock, SqlToolDefinition } from './tool-kit.js';
 /**
  * 数语句条数（去噪后按分号切）。
  *

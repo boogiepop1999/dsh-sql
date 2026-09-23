@@ -12,7 +12,8 @@
 
 import { loadSettings } from './settings.js'
 import { buildSettingsTools } from './settings-tools.js'
-import { buildSqlTools, type SqlToolDefinition } from './tools.js'
+import { buildSqlTools } from './tools.js'
+import type { SqlToolDefinition } from './tool-kit.js'
 
 /** cordis 服务注入：apply 里要用 ctx.tools，必须显式声明。 */
 export const name = 'sql'
