@@ -7,7 +7,7 @@
 import { DatabaseSync } from 'node:sqlite'
 import mysql from 'mysql2/promise'
 import pg from 'pg'
-import { assertIdentifier, type SqlConnectionConfig } from './config.js'
+import { assertIdentifier, missingConnectionFields, type SqlConnectionConfig } from './config.js'
 
 /** 查询结果：列名 + 行（值数组，无损 JSON 友好）。 */
 export interface QueryResult {
@@ -412,17 +412,8 @@ class PostgresAdapter implements DatabaseAdapter {
 export function createAdapter(connection: SqlConnectionConfig): DatabaseAdapter {
   // 不补默认值：缺字段要么是配置被手改坏了，要么是绕过 sql_connection_set 写入的。
   // 报出缺了什么，好过悄悄连到 localhost 或内存库上。
-  // 不查 user / password（有的库不要密码），mysql 也不查 database（可用全限定名查询）。
-  const missing: string[] = []
-  if (connection.engine === 'sqlite') {
-    if (connection.file === undefined || connection.file === '') missing.push('file')
-  } else {
-    if (connection.host === undefined || connection.host === '') missing.push('host')
-    if (connection.port === undefined) missing.push('port')
-    if (connection.engine === 'postgres' && (connection.database === undefined || connection.database === '')) {
-      missing.push('database')
-    }
-  }
+  // 规则与写入侧共用（missingConnectionFields），这里只负责措辞。
+  const missing = missingConnectionFields(connection)
   if (missing.length > 0) {
     throw new Error('连接配置缺少必填字段：' + missing.join('、') + '。请用 sql_connection_set 补全。')
   }

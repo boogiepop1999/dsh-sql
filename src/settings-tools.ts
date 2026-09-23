@@ -10,6 +10,7 @@ import {
   EXEC_TIMEOUT_MS,
   QUERY_TIMEOUT_MS,
   STATS_TIMEOUT_MS,
+  missingConnectionFields,
   resolveSettings,
   splitConnectionsByEnv,
   type ResolvedSqlSettings,
@@ -361,20 +362,8 @@ export function buildSettingsTools(): SqlToolDefinition[] {
       }
 
       // —— 写入前校验（读取侧不校验，这里是唯一把关点）——
-      // 只拦「不填就必错」的字段：user / password 不拦（有的库确实不要密码）；
-      // mysql 的 database 也不拦（不指定默认库时可用全限定名查询）。
-      const missing: string[] = []
-      const needText = (key: 'file' | 'host' | 'database'): void => {
-        const value = entry[key]
-        if (value === undefined || value === '') missing.push(key)
-      }
-      if (engine === 'sqlite') {
-        needText('file')
-      } else {
-        needText('host')
-        if (engine === 'postgres') needText('database')
-        if (entry.port === undefined) missing.push('port')
-      }
+      // 规则在 missingConnectionFields 里（与建连侧共用），这里只负责措辞。
+      const missing = missingConnectionFields(entry)
       if (missing.length > 0) {
         throw new Error('连接 "' + name + '"（' + engine + '）缺少必填字段：' + missing.join('、') + '。请用 sql_connection_set 补全。')
       }

@@ -77,6 +77,16 @@ export declare function resolveSettings(settings: SqlSettings | undefined | null
 /** 校验表名/标识符，防注入到 schema 语句。 */
 export declare function assertIdentifier(name: string, label: string): string;
 /**
+ * 列出连接缺少的必填字段（空数组 = 齐了）。
+ *
+ * **写入侧（`sql_connection_set`）与建连侧（`createAdapter`）共用这一份规则** ——
+ * 两处各写一遍必然漂移（曾经就出现过报错顺序不一致）。措辞由调用方拼，规则只此一处。
+ *
+ * 不查 `user` / `password`：有的库确实不要密码。也不查 mysql 的 `database`：
+ * 不指定默认库时可用全限定名查询。
+ */
+export declare function missingConnectionFields(connection: SqlConnectionConfig): string[];
+/**
  * 按 activeEnv 切分连接：能用的 / 不能用的。
  *
  * 匹配规则只有一条：`env` 为空的连接**任何环境都算可用**，否则要求 `env === activeEnv`。
