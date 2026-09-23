@@ -107,14 +107,18 @@ export function resolveSettings(settings: SqlSettings | undefined | null, env: N
       connection.description = raw.description.trim()
     }
     if (connection.engine === 'sqlite') {
-      connection.file = typeof raw.file === 'string' && raw.file.trim() !== '' ? raw.file.trim() : ':memory:'
+      if (typeof raw.file === 'string' && raw.file.trim() !== '') connection.file = raw.file.trim()
     } else {
-      connection.host = typeof raw.host === 'string' && raw.host.trim() !== '' ? raw.host.trim() : 'localhost'
-      connection.port = typeof raw.port === 'number' && Number.isInteger(raw.port) && raw.port > 0 ? raw.port : (connection.engine === 'postgres' ? 5432 : 3306)
-      connection.user = typeof raw.user === 'string' && raw.user.trim() !== '' ? raw.user.trim() : ''
-      connection.database = typeof raw.database === 'string' ? raw.database.trim() : ''
+      // 一律「有就写，没有就不写」—— 不补默认值。缺字段由 sql_connection_set 在写入时拦下，
+      // 读取侧补出来的默认值只会把「配置错了」伪装成「连不上」。
+      if (typeof raw.host === 'string' && raw.host.trim() !== '') connection.host = raw.host.trim()
+      if (typeof raw.port === 'number' && Number.isInteger(raw.port) && raw.port > 0) connection.port = raw.port
+      if (typeof raw.user === 'string' && raw.user.trim() !== '') connection.user = raw.user.trim()
+      if (typeof raw.database === 'string' && raw.database.trim() !== '') connection.database = raw.database.trim()
       const direct = typeof raw.password === 'string' ? raw.password.trim() : ''
-      connection.password = direct !== '' ? direct : (env[passwordEnvName(name)]?.trim() ?? '')
+      const fromEnv = env[passwordEnvName(name)]?.trim() ?? ''
+      const password = direct !== '' ? direct : fromEnv
+      if (password !== '') connection.password = password
     }
     connections.push(connection)
   }

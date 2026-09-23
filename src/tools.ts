@@ -336,10 +336,10 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
 
   const sqlQuery: SqlToolDefinition = {
     name: 'sql_query',
-    description: '执行只读 SQL 查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。一次只能一条语句，会做词法校验拦截写操作。connection 为连接名（必填，用 sql_settings 查看可见连接）。',
+    description: '执行只读 SQL 查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。一次只能一条语句，会做词法校验拦截写操作。',
     parameters: compileParameters({
-      sql: { type: 'string', required: true, description: '只读 SQL 语句（必填，单条）。' },
-      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可见连接）。' },
+      sql: { type: 'string', required: true, description: '只读 SQL 语句（单条）。' },
+      connection: { type: 'string', required: true, description: '连接名。用 sql_settings 查看可见连接。' },
       format: { type: 'string', description: '输出格式：table（默认表格）/ csv / json。csv 与 json 会额外返回 formatted 文本，便于落盘或转存。' },
     }),
     output: {
@@ -399,8 +399,8 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
     name: 'sql_exec',
     description: '执行写操作或 DDL（INSERT / UPDATE / DELETE / CREATE / ALTER / DROP 等）。一次只能一条语句。受该连接的 readOnly 开关保护，返回影响行数。',
     parameters: compileParameters({
-      sql: { type: 'string', required: true, description: '写操作/DDL SQL（必填）。' },
-      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可见连接）。' },
+      sql: { type: 'string', required: true, description: '写操作/DDL SQL。' },
+      connection: { type: 'string', required: true, description: '连接名。用 sql_settings 查看可见连接。' },
     }),
     output: {
       schema: execSchema,
@@ -439,10 +439,10 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
 
   const sqlSchema: SqlToolDefinition = {
     name: 'sql_schema',
-    description: '查看数据库结构：不给 table 列出全部表；给 table（表名）返回该表的列信息（名称/类型/非空/主键）。',
+    description: '查看数据库结构：返回表清单，或指定 table 时返回该表的列信息（名称/类型/非空/主键）。',
     parameters: compileParameters({
       table: { type: 'string', description: '表名（可选；缺省列出全部表）。' },
-      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可见连接）。' },
+      connection: { type: 'string', required: true, description: '连接名。用 sql_settings 查看可见连接。' },
     }),
     output: {
       schema: schemaToolSchema,
@@ -478,9 +478,9 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
 
   const sqlStats: SqlToolDefinition = {
     name: 'sql_stats',
-    description: '数据库概览统计：表数量、每张表的行数、库体积（SQLite 按页计算，MySQL/PostgreSQL 走系统表）。connection 为连接名（必填，用 sql_settings 查看可见连接）。适合在写查询前先了解数据规模。',
+    description: '数据库概览统计：表数量、每张表的行数、库体积（SQLite 按页计算，MySQL/PostgreSQL 走系统表）。',
     parameters: compileParameters({
-      connection: { type: 'string', required: true, description: '连接名（必填；用 sql_settings 查看可见连接）。' },
+      connection: { type: 'string', required: true, description: '连接名。用 sql_settings 查看可见连接。' },
     }),
     output: {
       schema: statsSchema,
@@ -541,7 +541,7 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
 
   const sqlHealth: SqlToolDefinition = {
     name: 'sql_health',
-    description: '逐连接做连通性测试（SELECT 1），返回每个连接通不通。只探在 activeEnv 下可见的连接（连接清单与全局设置用 sql_settings 看）。',
+    description: '逐连接做连通性测试（SELECT 1），返回每个连接通不通。只探在 activeEnv 下可见的连接。',
     parameters: compileParameters({}),
     output: {
       schema: healthSchema,

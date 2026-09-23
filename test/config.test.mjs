@@ -28,14 +28,32 @@ test('多连接解析 + 密码环境变量回退', () => {
   const cfg = resolveSettings({
     connections: {
       local: { engine: 'sqlite', file: './x.db' },
-      prod: { engine: 'postgres', host: 'db.internal', database: 'app' },
+      prod: { engine: 'postgres', host: 'db.internal', port: 5432, user: 'u', database: 'app' },
     },
   }, { DSH_SQL_PASSWORD_PROD: 'secret123' })
   assert.equal(cfg.connections.length, 2)
   const prod = byName(cfg, 'prod')
   assert.equal(prod.port, 5432)
-  assert.equal(prod.password, 'secret123')
+  assert.equal(prod.password, 'secret123', '密码走 DSH_SQL_PASSWORD_<NAME> 回退')
   assert.equal(passwordEnvName('my-db'), 'DSH_SQL_PASSWORD_MY_DB')
+})
+
+test('读取侧不补默认值：缺什么就没有什么', () => {
+  const cfg = resolveSettings({
+    connections: {
+      // 全都不给：不该冒出 localhost / 3306 / '' 这类凭空造出的值
+      bare: { engine: 'mysql' },
+      // sqlite 不给 file 也不该变成 :memory:
+      sq: { engine: 'sqlite' },
+    },
+  })
+  const bare = byName(cfg, 'bare')
+  assert.equal(bare.host, undefined)
+  assert.equal(bare.port, undefined)
+  assert.equal(bare.user, undefined)
+  assert.equal(bare.database, undefined)
+  assert.equal(bare.password, undefined)
+  assert.equal(byName(cfg, 'sq').file, undefined)
 })
 
 test('字典的键即连接名（区分大小写）', () => {
@@ -58,13 +76,13 @@ test('读取侧不校验：非法配置也原样读出（校验在写入工具�
   assert.doesNotThrow(() => resolveSettings({ environments: 'not-an-array' }))
 })
 
-test('database 读取侧不强制：postgres 缺库也能读出来', () => {
+test('database 读取侧不强制：缺了就缺着，由 sql_connection_set 把关', () => {
   const mysql = resolveSettings({ connections: { my: { engine: 'mysql', host: 'db' } } })
-  assert.equal(byName(mysql, 'my').database, '')
+  assert.equal(byName(mysql, 'my').database, undefined, '不再补成空串')
   const withDb = resolveSettings({ connections: { my: { engine: 'mysql', host: 'db', database: 'app' } } })
   assert.equal(byName(withDb, 'my').database, 'app')
   const pg = resolveSettings({ connections: { pg: { engine: 'postgres', host: 'db' } } })
-  assert.equal(byName(pg, 'pg').database, '', '读取侧不拦，由 sql_connection_set 把关')
+  assert.equal(byName(pg, 'pg').database, undefined, '读取侧不拦，由 sql_connection_set 把关')
 })
 
 test('连接级 readOnly 与 description', () => {

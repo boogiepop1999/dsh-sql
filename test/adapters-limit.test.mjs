@@ -5,7 +5,7 @@ import pg from 'pg'
 import { createAdapter } from '../lib/index.js'
 
 function pgFixture(values, { fail = false, stall = false } = {}) {
-  const adapter = createAdapter({ name: 'pg', engine: 'postgres', database: 'app' })
+  const adapter = createAdapter({ name: 'pg', engine: 'postgres', host: 'h', port: 5432, user: 'u', password: 'p', database: 'app' })
   const state = { released: [], produced: 0, query: undefined }
   adapter.pool = {
     async connect() {
@@ -44,7 +44,7 @@ test('PostgreSQL：真实 pg.Query 行事件在上限结束，内部不累计结
 })
 
 function mysqlFixture(values, { fail = false, stall = false } = {}) {
-  const adapter = createAdapter({ name: 'my', engine: 'mysql', database: 'app' })
+  const adapter = createAdapter({ name: 'my', engine: 'mysql', host: 'h', port: 3306, user: 'u', password: 'p', database: 'app' })
   const state = { destroyed: false, released: false, produced: 0 }
   adapter.pool = {
     async getConnection() {
@@ -135,7 +135,17 @@ test('MySQL / PostgreSQL：有界查询取消时销毁专用连接', async () =>
 
 test('MySQL / PostgreSQL：已取消的有界查询不请求连接', async () => {
   for (const engine of ['mysql', 'postgres']) {
-    const adapter = createAdapter({ name: 'unused', engine })
+    // 这个用例只验证「取消时不请求连接」，pool 随即被替换成探针，
+    // 但 createAdapter 会校验必填字段，所以得给全。
+    const adapter = createAdapter({
+      name: 'unused',
+      engine,
+      host: 'h',
+      port: engine === 'postgres' ? 5432 : 3306,
+      user: 'u',
+      password: 'p',
+      database: 'app',
+    })
     adapter.pool = {
       connect() { assert.fail('must not connect') },
       getConnection() { assert.fail('must not acquire') },
@@ -147,7 +157,7 @@ test('MySQL / PostgreSQL：已取消的有界查询不请求连接', async () =>
 })
 
 test('查询结果 bigint：安全整数转 number，超出安全范围转十进制字符串', async () => {
-  const adapter = createAdapter({ name: 'my', engine: 'mysql', database: 'app' })
+  const adapter = createAdapter({ name: 'my', engine: 'mysql', host: 'h', port: 3306, user: 'u', password: 'p', database: 'app' })
   adapter.pool = {
     async query(sql) {
       assert.equal(sql, 'SELECT safe, too_large, too_small FROM t')
@@ -166,7 +176,7 @@ test('查询结果 bigint：安全整数转 number，超出安全范围转十进
 })
 
 test('MySQL：取消信号销毁专用连接，不把取消后的连接放回池', async () => {
-  const adapter = createAdapter({ name: 'my', engine: 'mysql', database: 'app' })
+  const adapter = createAdapter({ name: 'my', engine: 'mysql', host: 'h', port: 3306, user: 'u', password: 'p', database: 'app' })
   let destroyed = false
   let released = false
   adapter.pool = {
@@ -188,7 +198,7 @@ test('MySQL：取消信号销毁专用连接，不把取消后的连接放回池
 })
 
 test('PostgreSQL：取消信号销毁专用连接', async () => {
-  const adapter = createAdapter({ name: 'pg', engine: 'postgres', database: 'app' })
+  const adapter = createAdapter({ name: 'pg', engine: 'postgres', host: 'h', port: 5432, user: 'u', password: 'p', database: 'app' })
   let forcedRelease = false
   adapter.pool = {
     async connect() {

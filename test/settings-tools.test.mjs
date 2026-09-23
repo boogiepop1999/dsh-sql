@@ -129,24 +129,66 @@ test('sql_connection_set：引擎非法报错且不落盘', async () => {
   } finally { box.cleanup() }
 })
 
-test('sql_connection_set：postgres 缺 database 报错', async () => {
+test('sql_connection_set：必填项按引擎区分（mysql 不要 database，postgres 要）', async () => {
   const box = makeSandbox()
   try {
+    // postgres 必填 host、port、database
     await assert.rejects(
-      () => box.tool('sql_connection_set').execute(connArgs({ name: 'pg', engine: 'postgres', host: 'h', port: 5432 })),
-      /postgres 连接必须给 database/,
+      () => box.tool('sql_connection_set').execute({ name: 'pg', engine: 'postgres' }),
+      (error) => {
+        assert.match(error.message, /缺少必填字段/)
+        assert.match(error.message, /host/)
+        assert.match(error.message, /port/)
+        assert.match(error.message, /database/)
+        assert.match(error.message, /请用 sql_connection_set 补全/)
+        return true
+      },
+    )
+    // mysql 只要 host、port —— 不指定默认库也能用全限定名查询
+    await box.tool('sql_connection_set').execute({ name: 'my', engine: 'mysql', host: 'h', port: 3306 })
+    assert.equal(box.conn('my').database, undefined, 'mysql 不因缺 database 被拦')
+    // 但 mysql 缺 host / port 仍要报错
+    await assert.rejects(
+      () => box.tool('sql_connection_set').execute({ name: 'my2', engine: 'mysql' }),
+      /缺少必填字段.*host/,
+    )
+    // sqlite 必须有 file
+    await assert.rejects(
+      () => box.tool('sql_connection_set').execute({ name: 'sq', engine: 'sqlite' }),
+      /缺少必填字段.*file/,
     )
   } finally { box.cleanup() }
 })
 
-test('sql_connection_set：mysql 允许 database 为空', async () => {
+test('sql_connection_set：user / password 不拦 —— 有的库确实不要密码', async () => {
   const box = makeSandbox()
   try {
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'my', engine: 'mysql', host: 'h', port: 3306 }))
-    const my = box.conn('my')
-    assert.ok(my !== undefined)
-    assert.ok(my.database === undefined || my.database === '')
+    // 不给 user / password 也能写入；是否连得上交给数据库报错
+    await box.tool('sql_connection_set').execute({
+      name: 'nopw', engine: 'postgres', host: 'h', port: 5432, database: 'd',
+    })
+    const conn = box.conn('nopw')
+    assert.ok(conn !== undefined)
+    assert.equal(conn.user, undefined, '不凭空造 user')
+    assert.equal(conn.password, undefined, '不凭空造 password')
   } finally { box.cleanup() }
+})
+
+test('sql_connection_set：密码可走 DSH_SQL_PASSWORD_<NAME> 环境变量顶替', async () => {
+  const box = makeSandbox()
+  const key = 'DSH_SQL_PASSWORD_ENVPG'
+  const before = process.env[key]
+  try {
+    process.env[key] = 'from-env'
+    await box.tool('sql_connection_set').execute({
+      name: 'envpg', engine: 'mysql', host: 'h', port: 3306, user: 'u', database: 'd',
+    })
+    assert.ok(box.conn('envpg') !== undefined, '环境变量提供了密码就不算缺')
+  } finally {
+    if (before === undefined) delete process.env[key]
+    else process.env[key] = before
+    box.cleanup()
+  }
 })
 
 test('sql_connection_set：部分更新 —— 未给的字段保持不变（password 不会被清掉）', async () => {
@@ -186,16 +228,16 @@ test('sql_connection_set：空串就是空串（不做清空语义）', async ()
   } finally { box.cleanup() }
 })
 
-test('sql_connection_set：新建时未给 file 用默认值，给了就照给', async () => {
+test('sql_connection_set：sqlite 必须显式给 file，不给就报错', async () => {
   const box = makeSandbox()
   try {
-    await box.tool('sql_connection_set').execute({ name: 'a', engine: 'sqlite' })
-    const a = box.conn('a')
-    assert.equal(a.file, undefined, '未给 file 时不写这个键（解析时兜底 :memory:）')
-
+    await assert.rejects(
+      () => box.tool('sql_connection_set').execute({ name: 'a', engine: 'sqlite' }),
+      /缺少必填字段.*file/,
+      '不再兜底成 :memory:',
+    )
     await box.tool('sql_connection_set').execute({ name: 'b', engine: 'sqlite', file: '/tmp/b.db' })
-    const b = box.conn('b')
-    assert.equal(b.file, '/tmp/b.db')
+    assert.equal(box.conn('b').file, '/tmp/b.db')
   } finally { box.cleanup() }
 })
 
