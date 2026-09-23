@@ -7,9 +7,6 @@
  */
 import {
   DESCRIPTION_MAX_LENGTH,
-  EXEC_TIMEOUT_MS,
-  QUERY_TIMEOUT_MS,
-  STATS_TIMEOUT_MS,
   missingConnectionFields,
   resolveSettings,
   splitConnectionsByEnv,
@@ -138,9 +135,6 @@ export function buildSettingsTools(): SqlToolDefinition[] {
       lines.push('| 当前环境 | ' + (activeEnv !== '' ? cell(activeEnv) : '（未设置）') + ' |')
       lines.push('| 环境清单 | ' + (environments.length > 0 ? environments.map(cell).join('、') : '（空）') + ' |')
       lines.push('| 行数上限 | ' + String(loaded.resolved.maxRows) + ' |')
-      lines.push('| 查询超时 | ' + String(QUERY_TIMEOUT_MS) + 'ms（代码常量，不可改） |')
-      lines.push('| 写超时 | ' + String(EXEC_TIMEOUT_MS) + 'ms（代码常量，不可改） |')
-      lines.push('| 统计超时 | ' + String(STATS_TIMEOUT_MS) + 'ms（代码常量，不可改） |')
       lines.push('| 配置文件 | `' + cell(loaded.file) + '` |')
 
       const problems: string[] = []

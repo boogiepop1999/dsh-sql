@@ -167,6 +167,7 @@ sql_connection_remove { name: legacy }
 
 - **词法级只读保护**：`sql_query` 先剥离字符串与注释再校验，拒绝 data-modifying CTE、SELECT INTO、FOR UPDATE/FOR SHARE、PRAGMA 赋值与多语句
 - **连接级 readOnly**：可逐个连接禁用写（生产库设 `readOnly: true`，QA 不受影响）
+- **`activeEnv` 不限制访问其他环境的连接**：它只决定 `sql_settings` 与 `sql_health` 里列哪些连接；其余工具用完整连接名即可跨环境访问
 - **不自带写审批**：插件不拦截写操作，权限交给 Harness 自身体系
 - **标识符校验**：表名只允许字母/数字/下划线/`$`，杜绝 schema 注入
 - **适配器指纹失效**：连接定义一改，缓存里的旧连接池立即失效重建，杜绝「改了配置却还打向老库」的静默错误
