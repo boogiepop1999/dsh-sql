@@ -25,7 +25,7 @@ dsh plugin --profile web remove dsh-sql   # 卸载
 $DSH_HOME/sql/settings.json
 ```
 
-`cordis.patch.yml` 一个字都不用写 —— 那里是 `apply()` 时一次性读入的启动配置，改了要重启，写坏了还会让 DSH 起不来。
+`cordis.patch.yml` 里**不写任何配置项**，只有一行挂载声明 —— 那里是 `apply()` 时一次性读入的启动配置，改了要重启，写坏了还会让 DSH 起不来。
 
 第一次调用任何工具时会自动生成出厂设置（**空的，需要自己配连接**）：
 
@@ -48,6 +48,8 @@ $DSH_HOME/sql/settings.json
     "polar": {
       "engine": "mysql",       // sqlite / mysql / postgres
       "host": "10.0.0.1",
+      "port": 3306,            // mysql / postgres 必填，没有默认值
+      "user": "ops_readonly",  // 密码走 DSH_SQL_PASSWORD_POLAR 环境变量
       "database": "app",
       "env": "qa",             // 所属环境
       "description": "QA 主库"
@@ -55,7 +57,9 @@ $DSH_HOME/sql/settings.json
     "gp-pro": {
       "engine": "postgres",
       "host": "10.0.0.2",
-      "database": "cg-prd",
+      "port": 5432,
+      "user": "ops_readonly",
+      "database": "cg-prd",    // postgres 必填
       "env": "prod",
       "readOnly": true,        // 该连接禁用写
       "description": "生产 GP，慎写"
@@ -69,7 +73,7 @@ $DSH_HOME/sql/settings.json
 
 ```
 sql_config_set({ environments: ["qa", "prod"], activeEnv: "qa" })
-sql_connection_set({ name: "polar", engine: "mysql", host: "10.0.0.1", database: "app", env: "qa" })
+sql_connection_set({ name: "polar", engine: "mysql", host: "10.0.0.1", port: 3306, user: "ops_readonly", password: "...", database: "app", env: "qa" })
 ```
 
 > ⚠ 连接密码在 `settings.json` 里是**明文**。这个文件别外传。
@@ -87,7 +91,7 @@ sql_connection_set({ name: "polar", engine: "mysql", host: "10.0.0.1", database:
 
 `activeEnv` 为空时没有连接能靠环境名匹配，因此只有不限环境的那批可见 —— 与设了环境时同一套规则。
 
-`activeEnv` 只影响展示，**不影响调用** —— 任何工具都用完整连接名，随时可以跨环境查。
+`activeEnv` 只影响 `sql_settings` 与 `sql_health` 的可见清单，**不影响 `sql_query` / `sql_exec` / `sql_schema` / `sql_stats`** —— 这四个用完整连接名，随时可以跨环境查。
 
 ### 超时
 
@@ -99,9 +103,11 @@ sql_connection_set({ name: "polar", engine: "mysql", host: "10.0.0.1", database:
 | `EXEC_TIMEOUT_MS` | 30 秒 | `sql_exec` |
 | `STATS_TIMEOUT_MS` | 2 分钟 | `sql_stats`（逐表 `COUNT(*)`，单独放宽） |
 
+其余工具的超时同样是代码常量：`sql_schema` / `sql_health` 各 30 秒，四个配置管理工具各 10 秒。
+
 原因：Harness 的 `timeoutMs` 在工具注册时求值一次，做成配置项就得重启才生效 —— 与「改配置立即生效」的设计冲突，索性定死。要调就改 `src/config.ts` 重新构建。
 
-超时是**护栏**而非「够用的上限」：走得通索引的查询秒级就回，走不通的 60 秒也回不来，早失败能让 agent 更快改换查法。
+超时是**护栏**而非「够用的上限」：走得通索引的查询秒级就回，走不通的再等也回不来，早失败能让 agent 更快改换查法。
 
 **超时后的提示按读写分开**（安全优先，且**只指出问题、不列具体手段**——免得把 AI 的思路钉死）：
 
@@ -115,8 +121,8 @@ sql_connection_set({ name: "polar", engine: "mysql", host: "10.0.0.1", database:
 | 字段 | 引擎 | 说明 |
 | :-- | :-- | :-- |
 | `engine` | 全部 | `sqlite` / `mysql` / `postgres` |
-| `file` | sqlite | 数据库文件路径，缺省 `:memory:` |
-| `host` / `port` | mysql / postgres | 缺省 `localhost`、`3306` / `5432` |
+| `file` | sqlite | **必填**：数据库文件路径，如 `:memory:` |
+| `host` / `port` | mysql / postgres | **必填**；无默认值，不填会在写入与建连时报错 |
 | `user` / `password` | mysql / postgres | 密码也可走环境变量 `DSH_SQL_PASSWORD_<连接名大写>` |
 | `database` | postgres **必填**，mysql 可选 | MySQL 不填即不指定默认库，可用 `` `db`.`table` `` 全限定名 |
 | `readOnly` | 全部 | 该连接禁用写操作，缺省 `false` |
@@ -129,10 +135,10 @@ sql_connection_set({ name: "polar", engine: "mysql", host: "10.0.0.1", database:
 | :-- | :-- | :-- |
 | `sql_settings` | 总览：当前环境的连接 + 全局设置 | 每次现读 |
 | `sql_config_set` | 改全局设置（activeEnv / environments / 行数上限）| 环境双向校验 |
-| `sql_connection_set` | 新增或更新一个连接 | 引擎字段、pg 库名、env 归属校验 |
+| `sql_connection_set` | 新增或更新一个连接 | 引擎与必填字段、port 正整数、env 归属校验 |
 | `sql_connection_remove` | 删除一个连接 | 先确认存在 |
 | `sql_query` | 只读查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）| 关键字白名单 + 拒绝多语句 |
-| `sql_exec` | 写操作 / DDL（可多语句脚本）| 连接级 readOnly |
+| `sql_exec` | 写操作 / DDL（INSERT / UPDATE / DELETE / CREATE / ALTER / DROP 等）| 连接级 readOnly + 单语句限制 |
 | `sql_schema` | 表清单 / 表结构 | 标识符白名单校验 |
 | `sql_stats` | 表数量、行数与库体积概览 | 表名引用 + 查询失败隔离 |
 | `sql_health` | 逐连接探活（并发） | 不回显密码 |
@@ -153,7 +159,7 @@ sql_exec { connection: polar, sql: UPDATE orders SET status = 'paid' WHERE id = 
 
 sql_config_set { environments: ["qa", "prod"] }      # 配置环境清单
 sql_config_set { activeEnv: "qa" }                   # 切到 qa
-sql_connection_set { name: polar, engine: mysql, host: 10.0.0.1, database: app, env: qa }
+sql_connection_set { name: polar, engine: mysql, host: 10.0.0.1, port: 3306, user: ops, password: '...', database: app, env: qa }
 sql_connection_remove { name: legacy }
 ```
 
@@ -162,13 +168,14 @@ sql_connection_remove { name: legacy }
 - **词法级只读保护**：`sql_query` 先剥离字符串与注释再校验，拒绝 data-modifying CTE、SELECT INTO、FOR UPDATE/FOR SHARE、PRAGMA 赋值与多语句
 - **连接级 readOnly**：可逐个连接禁用写（生产库设 `readOnly: true`，QA 不受影响）
 - **不自带写审批**：插件不拦截写操作，权限交给 Harness 自身体系
-- **标识符校验**：表名只允许字母/数字/下划线，杜绝 schema 注入
+- **标识符校验**：表名只允许字母/数字/下划线/`$`，杜绝 schema 注入
 - **适配器指纹失效**：连接定义一改，缓存里的旧连接池立即失效重建，杜绝「改了配置却还打向老库」的静默错误
 - **密钥可走环境变量**：密码支持 `DSH_SQL_PASSWORD_<连接名>`，优先于设置文件里的明文
 
 ## 实现要点
 
-- **配置只归一化、不校验**：读取侧不抛错，配置写错了插件照常起得来，问题在调用或 `sql_health` 时暴露，改掉即可 —— 不会出现「一条坏连接锁死整个插件」
+- **读取侧只归一化、不校验**：读配置不抛错，坏配置不会把插件锁死（问题在调用时暴露）；**校验只做在写入侧**（`sql_connection_set` 写入前把关必填字段与取值）
+- **不补默认值**：连接字段「有就写，没有就不写」，缺了报错而不是猜 —— 猜出来的默认值会把「配置错了」伪装成「连不上」
 - **流式行数钳制**：最多收集 `maxRows+1` 行，超量标记 `truncated`；MySQL / PostgreSQL 达上限时关闭该查询的专用连接，未达上限则归还连接池，避免全量结果驻留内存
 - **可取消执行**：遵守 Harness 的 `exec.signal`，取消时销毁正在工作的专用连接
 - **大整数无损**：bigint 在安全整数范围内输出 number，超出则输出十进制字符串，避免静默丢精度
