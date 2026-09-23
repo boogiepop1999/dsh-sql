@@ -63,8 +63,7 @@ test('apply 首次运行时生成出厂配置文件', () => {
     assert.equal(written.activeEnv, '')
     assert.deepEqual(written.environments, [])
     assert.equal(written.maxRows, 1000)
-    assert.equal(written.queryTimeoutMs, 60000)
-    assert.equal(written.execTimeoutMs, 120000)
+    assert.deepEqual(Object.keys(written).sort(), ['activeEnv', 'connections', 'environments', 'maxRows'], '超时是代码常量，不该出现在设置文件里')
   } finally { box.cleanup() }
 })
 

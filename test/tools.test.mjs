@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildSqlTools, resolveSettings, assertReadQuery } from '../lib/index.js'
+import { buildSqlTools, resolveSettings, assertReadQuery, QUERY_TIMEOUT_MS, EXEC_TIMEOUT_MS } from '../lib/index.js'
 
 const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-tools-'))
 const cfg = resolveSettings({ connections: { local: { engine: 'sqlite', file: join(dir, 'app.db') } }, maxRows: 2 })
@@ -13,16 +13,16 @@ const query = tools.find((t) => t.name === 'sql_query')
 const exec = tools.find((t) => t.name === 'sql_exec')
 const schema = tools.find((t) => t.name === 'sql_schema')
 
-test('工具 timeoutMs 取配置值', () => {
+test('工具 timeoutMs 取代码常量，不受设置文件影响', () => {
   const timed = buildSqlTools(fixed(resolveSettings({
     connections: cfg.connections,
     maxRows: 2,
     queryTimeoutMs: 15000,
     execTimeoutMs: 30000,
   }))).tools
-  assert.equal(timed.find((t) => t.name === 'sql_query').timeoutMs, 15000)
-  assert.equal(timed.find((t) => t.name === 'sql_exec').timeoutMs, 30000)
-  assert.equal(timed.find((t) => t.name === 'sql_health').timeoutMs, 30000)
+  assert.equal(timed.find((t) => t.name === 'sql_query').timeoutMs, QUERY_TIMEOUT_MS)
+  assert.equal(timed.find((t) => t.name === 'sql_exec').timeoutMs, EXEC_TIMEOUT_MS)
+  assert.equal(timed.find((t) => t.name === 'sql_health').timeoutMs, 30000, 'sql_health 仍是自己的固定 30 秒')
 })
 
 test('构建 5 个数据库操作工具且名字正确', () => {

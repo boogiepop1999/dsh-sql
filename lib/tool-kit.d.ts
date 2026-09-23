@@ -65,3 +65,17 @@ export declare const textOutput: {
 };
 /** 所有配置管理工具共用的告诫语。 */
 export declare const CONFIG_WRITE_WARNING = "\u26A0 **\u4EC5\u5F53\u7528\u6237\u660E\u786E\u8981\u6C42\u65F6\u624D\u8C03\u7528 \u2014\u2014 \u4E0D\u5F97\u81EA\u884C\u5224\u65AD\u3001\u4E0D\u5F97\u4E3B\u52A8\u8C03\u7528\u3002**";
+/** 判断一个错误是否是中止（超时 / 取消）导致的。 */
+export declare function isAbortError(error: unknown): boolean;
+/**
+ * 查询超时的提示：读操作重试**不会造成破坏**，但也不能一直试 ——
+ * 超时说明语句本身太重，撞几次就该停下来找人确认。
+ *
+ * 只指出问题与边界，**不给具体手段** —— 列一堆招法反而会把思路钉死。
+ */
+export declare function queryTimeoutError(seconds: number, sql: string): Error;
+/**
+ * 写操作超时的提示：**禁止重试** —— 超时只说明本端不再等待，
+ * 服务端可能仍在执行、也可能已经提交，重跑有把变更做两遍的风险。
+ */
+export declare function execTimeoutError(seconds: number, sql: string): Error;

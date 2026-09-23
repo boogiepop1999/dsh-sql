@@ -34,9 +34,7 @@ $DSH_HOME/sql/settings.json
   "activeEnv": "",             // 当前环境；空 = 只有不限环境的连接可见
   "environments": [],          // 环境清单，如 ["qa", "prod"]
   "connections": {},           // 键即连接名；下面是长成的样子
-  "maxRows": 1000,             // 查询返回行数上限（1-10000）
-  "queryTimeoutMs": 60000,     // 单次查询超时（5 秒 - 10 分钟）
-  "execTimeoutMs": 120000      // 单次写操作超时（5 秒 - 10 分钟）
+  "maxRows": 1000              // 查询返回行数上限（1-10000）
 }
 ```
 
@@ -63,9 +61,7 @@ $DSH_HOME/sql/settings.json
       "description": "生产 GP，慎写"
     }
   },
-  "maxRows": 1000,
-  "queryTimeoutMs": 60000,
-  "execTimeoutMs": 120000
+  "maxRows": 1000
 }
 ```
 
@@ -93,6 +89,25 @@ sql_connection_set({ name: "polar", engine: "mysql", host: "10.0.0.1", database:
 
 `activeEnv` 只影响展示，**不影响调用** —— 任何工具都用完整连接名，随时可以跨环境查。
 
+### 超时
+
+三个超时都是**代码常量**，**不在设置文件里、也不可配置**：
+
+| 常量 | 值 | 用于 |
+| :-- | :-- | :-- |
+| `QUERY_TIMEOUT_MS` | 30 秒 | `sql_query` |
+| `EXEC_TIMEOUT_MS` | 30 秒 | `sql_exec` |
+| `STATS_TIMEOUT_MS` | 2 分钟 | `sql_stats`（逐表 `COUNT(*)`，单独放宽） |
+
+原因：Harness 的 `timeoutMs` 在工具注册时求值一次，做成配置项就得重启才生效 —— 与「改配置立即生效」的设计冲突，索性定死。要调就改 `src/config.ts` 重新构建。
+
+超时是**护栏**而非「够用的上限」：走得通索引的查询秒级就回，走不通的 60 秒也回不来，早失败能让 agent 更快改换查法。
+
+**超时后的提示按读写分开**（安全优先，且**只指出问题、不列具体手段**——免得把 AI 的思路钉死）：
+
+- `sql_query` 超时 → 说明这是工具护栏（不是环境不稳），**可有限重试**；多次仍超时则说明超出适用范围，要求与用户确认
+- `sql_exec` 超时 → ⚠ 写操作**可能已在库上执行**，**禁止重试**，必须与用户确认
+
 ### 连接字段
 
 **`connections` 是以连接名为键的对象**（键区分大小写）。
@@ -113,7 +128,7 @@ sql_connection_set({ name: "polar", engine: "mysql", host: "10.0.0.1", database:
 | 工具 | 作用 | 安全 |
 | :-- | :-- | :-- |
 | `sql_settings` | 总览：当前环境的连接 + 全局设置 | 每次现读 |
-| `sql_config_set` | 改全局设置（activeEnv / environments / 行数上限 / 超时）| 环境双向校验 |
+| `sql_config_set` | 改全局设置（activeEnv / environments / 行数上限）| 环境双向校验 |
 | `sql_connection_set` | 新增或更新一个连接 | 引擎字段、pg 库名、env 归属校验 |
 | `sql_connection_remove` | 删除一个连接 | 先确认存在 |
 | `sql_query` | 只读查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）| 关键字白名单 + 拒绝多语句 |

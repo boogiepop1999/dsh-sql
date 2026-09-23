@@ -1,6 +1,17 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { resolveSettings, assertIdentifier, passwordEnvName, splitConnectionsByEnv } from '../lib/index.js'
+import {
+  resolveSettings,
+  assertIdentifier,
+  passwordEnvName,
+  splitConnectionsByEnv,
+  queryTimeoutError,
+  execTimeoutError,
+  isAbortError,
+  QUERY_TIMEOUT_MS,
+  EXEC_TIMEOUT_MS,
+  STATS_TIMEOUT_MS,
+} from '../lib/index.js'
 
 /** 解析后的连接按名字取（字典 → 列表，列表元素带 name）。 */
 const byName = (cfg, name) => cfg.connections.find((conn) => conn.name === name)
@@ -96,20 +107,53 @@ test('activeEnv 读取侧 trim，缺省为空串', () => {
   assert.equal(resolveSettings({ activeEnv: '  qa  ' }).activeEnv, 'qa')
 })
 
-test('queryTimeoutMs / execTimeoutMs 缺省与钳制', () => {
-  const defaults = resolveSettings({})
-  assert.equal(defaults.queryTimeoutMs, 60000)
-  assert.equal(defaults.execTimeoutMs, 120000)
-  const custom = resolveSettings({ queryTimeoutMs: 7000, execTimeoutMs: 9999999 })
-  assert.equal(custom.queryTimeoutMs, 7000)
-  assert.equal(custom.execTimeoutMs, 600000)
-  // 非法值不再抛错（范围校验在 sql_config_set），读取侧只做钳制
-  assert.doesNotThrow(() => resolveSettings({ queryTimeoutMs: -1 }))
-  assert.doesNotThrow(() => resolveSettings({ execTimeoutMs: 'x' }))
+test('超时是代码常量，不进设置文件也不被解析', () => {
+  assert.equal(QUERY_TIMEOUT_MS, 30000)
+  assert.equal(EXEC_TIMEOUT_MS, 30000)
+  assert.equal(STATS_TIMEOUT_MS, 120000)
+  const cfg = resolveSettings({ queryTimeoutMs: 7000, execTimeoutMs: 9999999 })
+  assert.equal(cfg.queryTimeoutMs, undefined, '设置文件里的超时字段被忽略')
+  assert.equal(cfg.execTimeoutMs, undefined)
 })
 
 test('maxRows 钳制到 10000', () => {
   assert.equal(resolveSettings({ maxRows: 999999 }).maxRows, 10000)
+})
+
+test('超时提示：查询可有限重试，写操作一律禁止重试', () => {
+  const q = queryTimeoutError(30, 'SELECT * FROM big').message
+  assert.match(q, /30 秒/)
+  assert.match(q, /超时只说明本端不再等待/, '两边都要点明超时的本质')
+  assert.match(q, /本工具限制执行大语句查询/, '让 AI 知道是护栏，不是环境不稳')
+  assert.match(q, /可以适量更换条件重试/)
+  assert.match(q, /若多次仍超时/, '给出兜底：多次不行就找人')
+  assert.match(q, /请与用户确认/)
+  assert.match(q, /SELECT \* FROM big/, '带上原语句，便于定位')
+
+  const e = execTimeoutError(30, 'UPDATE t SET x=1').message
+  assert.match(e, /30 秒/)
+  assert.match(e, /超时只说明本端不再等待/)
+  assert.match(e, /写操作可能已在库上执行/, '重试有风险的根据')
+  assert.match(e, /执行超时禁止重试/)
+  assert.match(e, /需要与用户确认/)
+  assert.match(e, /UPDATE t SET x=1/)
+  // 写侧绝不能出现任何鼓励重试的措辞
+  for (const bad of ['可以适量', '可以重试', '重试是安全的', '换个方式']) {
+    assert.ok(!e.includes(bad), '写提示不该鼓励重试：' + bad)
+  }
+  // 只指出问题，不列具体手段 —— 免得把 AI 的思路钉死
+  for (const advice of ['EXPLAIN', 'LIMIT', 'sql_schema', 'COUNT', '索引', '·']) {
+    assert.ok(!q.includes(advice), '查询提示不该给具体手段：' + advice)
+    assert.ok(!e.includes(advice), '写提示不该给具体手段：' + advice)
+  }
+})
+
+test('isAbortError 只认中止类错误', () => {
+  const abort = new Error('The operation was aborted.')
+  abort.name = 'AbortError'
+  assert.equal(isAbortError(abort), true)
+  assert.equal(isAbortError(new Error('connect ECONNREFUSED')), false)
+  assert.equal(isAbortError('not an error'), false)
 })
 
 test('assertIdentifier 防注入', () => {

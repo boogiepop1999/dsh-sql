@@ -289,8 +289,18 @@ test('sql_config_set：超范围报错且不落盘', async () => {
     await box.tool('sql_settings').execute({})
     const before = box.read()
     await assert.rejects(() => box.tool('sql_config_set').execute({ maxRows: 99999 }), /1~10000/)
-    await assert.rejects(() => box.tool('sql_config_set').execute({ queryTimeoutMs: 10 }), /5000~600000/)
     assert.deepEqual(box.read(), before)
+  } finally { box.cleanup() }
+})
+
+test('sql_config_set：只传已废弃的超时字段会被当成没给任何参数', async () => {
+  const box = makeSandbox()
+  try {
+    await box.tool('sql_settings').execute({})
+    await assert.rejects(
+      () => box.tool('sql_config_set').execute({ queryTimeoutMs: 30000 }),
+      /至少要给 activeEnv \/ environments \/ maxRows 之一/,
+    )
   } finally { box.cleanup() }
 })
 

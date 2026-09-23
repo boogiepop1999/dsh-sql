@@ -64,9 +64,7 @@ export function normalizeSettings(raw: unknown): SqlSettings {
     }
     out.connections = source.connections as Record<string, SqlConnectionConfig>
   }
-  for (const key of ['maxRows', 'queryTimeoutMs', 'execTimeoutMs'] as const) {
-    if (source[key] !== undefined) out[key] = source[key] as number
-  }
+  if (source.maxRows !== undefined) out.maxRows = source.maxRows as number
   return out
 }
 
@@ -77,8 +75,6 @@ export function defaultSettings(): SqlSettings {
     environments: [],
     connections: {},
     maxRows: 1000,
-    queryTimeoutMs: 60000,
-    execTimeoutMs: 120000,
   }
 }
 

@@ -6,12 +6,15 @@
  * @module dsh-sql/tools
  */
 import { createAdapter, type DatabaseAdapter } from './adapters.js'
-import { type ResolvedSqlSettings, type NamedSqlConnection, splitConnectionsByEnv } from './config.js'
+import { type ResolvedSqlSettings, type NamedSqlConnection, splitConnectionsByEnv, QUERY_TIMEOUT_MS, EXEC_TIMEOUT_MS, STATS_TIMEOUT_MS } from './config.js'
 import {
   asRecord,
   compileParameters,
+  execTimeoutError,
   executionSignal,
+  isAbortError,
   optionalString,
+  queryTimeoutError,
   requiredString,
   type ContentBlock,
   type SqlToolDefinition,
@@ -351,7 +354,16 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
       const sql = assertReadQuery(requiredString(args, 'sql', 'SQL 语句'))
       const maxRows = loadConfig().maxRows
       const { adapter, name } = getAdapter(optionalString(args, 'connection'))
-      const result = await adapter.query(sql, maxRows + 1, executionSignal(exec))
+      let result
+      try {
+        result = await adapter.query(sql, maxRows + 1, executionSignal(exec))
+      } catch (error) {
+        // 超时按「撤销用户的取消」处理：只有非取消的中止才换成指导性文案。
+        if (isAbortError(error) && executionSignal(exec)?.aborted !== true) {
+          throw queryTimeoutError(QUERY_TIMEOUT_MS / 1000, sql)
+        }
+        throw error
+      }
       const total = result.rows.length
       const rows = result.rows.slice(0, maxRows)
       const format = optionalString(args, 'format')?.toLowerCase() ?? 'table'
@@ -370,7 +382,7 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
       }
       return base
     },
-    timeoutMs: loadConfig().queryTimeoutMs,
+    timeoutMs: QUERY_TIMEOUT_MS,
   }
 
   const sqlExec: SqlToolDefinition = {
@@ -395,10 +407,18 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
       if (connection.readOnly === true) {
         throw new Error('连接 ' + connection.name + ' 的 readOnly=true，sql_exec 已被禁用。需要写操作请把该连接的 readOnly 改为 false（用 sql_connection_set，或直接编辑配置文件）。')
       }
-      const changes = await adapterFor(connection).exec(sql, executionSignal(exec))
+      let changes: number
+      try {
+        changes = await adapterFor(connection).exec(sql, executionSignal(exec))
+      } catch (error) {
+        if (isAbortError(error) && executionSignal(exec)?.aborted !== true) {
+          throw execTimeoutError(EXEC_TIMEOUT_MS / 1000, sql)
+        }
+        throw error
+      }
       return { connection: connection.name, changes, readOnly: false }
     },
-    timeoutMs: loadConfig().execTimeoutMs,
+    timeoutMs: EXEC_TIMEOUT_MS,
   }
 
   const sqlSchema: SqlToolDefinition = {
@@ -500,7 +520,7 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
       }
       return { connection: name, engine, tableCount: tables.filter((t) => t.name !== '').length, tables, sizeBytes }
     },
-    timeoutMs: loadConfig().queryTimeoutMs,
+    timeoutMs: STATS_TIMEOUT_MS,
   }
 
   const sqlHealth: SqlToolDefinition = {

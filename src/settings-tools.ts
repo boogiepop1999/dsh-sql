@@ -7,6 +7,9 @@
  */
 import {
   DESCRIPTION_MAX_LENGTH,
+  EXEC_TIMEOUT_MS,
+  QUERY_TIMEOUT_MS,
+  STATS_TIMEOUT_MS,
   resolveSettings,
   splitConnectionsByEnv,
   type ResolvedSqlSettings,
@@ -27,8 +30,6 @@ import {
 /** 可被 sql_config_set 修改的全局字段及其范围。 */
 export const CONFIG_LIMITS = {
   maxRows: { min: 1, max: 10000, label: '查询返回行数上限' },
-  queryTimeoutMs: { min: 5000, max: 600000, label: '查询超时（毫秒）' },
-  execTimeoutMs: { min: 5000, max: 600000, label: '写操作超时（毫秒）' },
 } as const
 
 type ConfigKey = keyof typeof CONFIG_LIMITS
@@ -136,8 +137,9 @@ export function buildSettingsTools(): SqlToolDefinition[] {
       lines.push('| 当前环境 | ' + (activeEnv !== '' ? cell(activeEnv) : '（未设置）') + ' |')
       lines.push('| 环境清单 | ' + (environments.length > 0 ? environments.map(cell).join('、') : '（空）') + ' |')
       lines.push('| 行数上限 | ' + String(loaded.resolved.maxRows) + ' |')
-      lines.push('| 查询超时 | ' + String(loaded.resolved.queryTimeoutMs) + 'ms |')
-      lines.push('| 写超时 | ' + String(loaded.resolved.execTimeoutMs) + 'ms |')
+      lines.push('| 查询超时 | ' + String(QUERY_TIMEOUT_MS) + 'ms（代码常量，不可改） |')
+      lines.push('| 写超时 | ' + String(EXEC_TIMEOUT_MS) + 'ms（代码常量，不可改） |')
+      lines.push('| 统计超时 | ' + String(STATS_TIMEOUT_MS) + 'ms（代码常量，不可改） |')
       lines.push('| 配置文件 | `' + cell(loaded.file) + '` |')
 
       const problems: string[] = []
@@ -158,14 +160,12 @@ export function buildSettingsTools(): SqlToolDefinition[] {
   const sqlConfigSet: SqlToolDefinition = {
     name: 'sql_config_set',
     description:
-      '改全局设置：activeEnv / environments / maxRows / queryTimeoutMs / execTimeoutMs，至少一个入参。改动重启 DSH 后生效。\n' +
+      '改全局设置：activeEnv / environments / maxRows，至少一个入参。立即生效，不用重启。\n' +
       CONFIG_WRITE_WARNING,
     parameters: compileParameters({
       activeEnv: { type: 'string', description: '当前环境名。必须已存在于 environments 里；传空串表示不设置环境。' },
       environments: { type: 'array', description: '环境清单（字符串数组，自动去重、去空）。非空时改完 activeEnv 必须仍在其中；传空数组表示不使用环境，会一并清空 activeEnv。' },
       maxRows: { type: 'number', description: '查询返回行数上限（1-10000）。' },
-      queryTimeoutMs: { type: 'number', description: '单次查询超时（毫秒，5000-600000）。' },
-      execTimeoutMs: { type: 'number', description: '单次写操作超时（毫秒，5000-600000）。' },
     }),
     output: textOutput,
     async execute(rawArgs) {
