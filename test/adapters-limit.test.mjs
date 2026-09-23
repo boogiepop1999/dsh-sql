@@ -284,3 +284,21 @@ test('PostgreSQL：client.query() 返回 rejected promise 时被接住，不崩�
   )
   assert.deepEqual(released, [true], '损坏的连接必须被销毁，不能放回池里复用')
 })
+
+test('AggregateError 的子错误都掏不出信息时，至少报出条数', async () => {
+  const adapter = createAdapter({ name: 'pg', engine: 'postgres', host: 'h', port: 5432, user: 'u', password: 'p', database: 'app' })
+  adapter.pool = {
+    async connect() {
+      // 两个子错误都没有 message、也没有 code —— 旧实现会落到「AggregateError」这种空壳文案
+      throw new AggregateError([new Error(''), new Error('')])
+    },
+  }
+  await assert.rejects(
+    () => adapter.query('SELECT 1', undefined, new AbortController().signal),
+    (error) => {
+      assert.notEqual(error.message, 'AggregateError', '不能只报类型名')
+      assert.match(error.message, /2 个子错误/, '要报出条数')
+      return true
+    },
+  )
+})

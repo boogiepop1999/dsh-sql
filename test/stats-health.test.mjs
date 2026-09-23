@@ -68,6 +68,15 @@ test('sql_query 默认格式不产生 formatted 字段', async () => {
   assert.equal(value.formatted, undefined)
 })
 
+test('sql_query：非法 format 直接报错，不静默退化', async () => {
+  const { tools } = makeTools()
+  const query = tools.find((t) => t.name === 'sql_query')
+  await assert.rejects(
+    () => query.execute({ sql: 'SELECT 1', format: 'XML', connection: 'local' }),
+    /format 只支持 table \/ csv \/ json/,
+  )
+})
+
 test('toCsv 空结果只输出表头', () => {
   assert.equal(toCsv(['a', 'b'], []), 'a,b')
 })

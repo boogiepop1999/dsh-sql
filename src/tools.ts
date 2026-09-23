@@ -72,7 +72,6 @@ const execSchema = {
   properties: {
     connection: { type: 'string' },
     changes: { type: 'integer' },
-    readOnly: { type: 'boolean' },
   },
   additionalProperties: true,
 }
@@ -195,7 +194,7 @@ function connectionFingerprint(connection: NamedSqlConnection): string {
 }
 
 /** 构建工具定义；设置**每次调用现读**，adapters 按连接名缓存并按指纹失效。 */
-export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: SqlToolDefinition[]; adapters: Map<string, DatabaseAdapter> } {
+export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: SqlToolDefinition[]; adapters: ReadonlyMap<string, DatabaseAdapter> } {
   /**
    * 适配器缓存：按连接名缓存，但每次比对指纹。
    *
@@ -303,6 +302,9 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
       const total = result.rows.length
       const rows = result.rows.slice(0, maxRows)
       const format = optionalString(args, 'format')?.toLowerCase() ?? 'table'
+      if (format !== 'table' && format !== 'csv' && format !== 'json') {
+        throw new Error('format 只支持 table / csv / json，收到 ' + JSON.stringify(format) + '。')
+      }
       const base = {
         connection: name,
         columns: result.columns,
@@ -358,7 +360,7 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
         }
         throw error
       }
-      return { connection: connection.name, changes, readOnly: false }
+      return { connection: connection.name, changes }
     },
     timeoutMs: EXEC_TIMEOUT_MS,
   }

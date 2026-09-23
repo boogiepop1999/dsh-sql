@@ -51,18 +51,42 @@ function abortReason(signal: AbortSignal): unknown {
  */
 function describeDriverError(error: unknown): Error {
   if (error instanceof AggregateError && error.errors.length > 0) {
-    const inner = error.errors.map((item) => describeDriverError(item).message).filter((text) => text !== '')
-    if (inner.length > 0) return new Error(inner.join('；'), { cause: error })
+    const parts: string[] = []
+    let blank = 0
+    for (const item of error.errors) {
+      const converted = describeDriverError(item)
+      // isBlankDetail 标出的是「掏不出信息」的兜底文案，不是真内容 —— 平铺时只计数，不重复贴出来。
+      if (isBlankDetail(converted)) blank += 1
+      else parts.push(converted.message)
+    }
+    if (blank > 0) parts.push(String(blank) + ' 个子错误未提供信息')
+    return new Error(parts.join('；'), { cause: error })
   }
   if (error instanceof Error) {
     if (error.message !== '') return error
-    // message 为空时按 code / errno / syscall 拼一个，总比空字符串强。
-    const detail = [error.name, (error as { code?: unknown }).code, (error as { syscall?: unknown }).syscall]
-      .filter((part) => typeof part === 'string' && part !== '')
-      .join(' ')
-    return new Error(detail !== '' ? detail : '未知错误（驱动未给出信息）', { cause: error })
+    // message 为空时按 code / syscall 拼一个。**不拿 name 当内容** —— 单独一个
+    // 「Error」或「AggregateError」等于没报，反而让上层以为拿到了有用信息。
+    const code = (error as { code?: unknown }).code
+    const syscall = (error as { syscall?: unknown }).syscall
+    const detail = [code, syscall].filter((part) => typeof part === 'string' && part !== '').join(' ')
+    return detail !== ''
+      ? new Error(error.name + ' ' + detail, { cause: error })
+      : blankDetail(error.name)
   }
   return new Error(String(error))
+}
+
+/** 「掏不出信息」的兜底错误：带 `blankDetail` 标记，便于平铺时识别而不必猜文案。 */
+interface BlankDetail extends Error {
+  blankDetail: true
+}
+function blankDetail(name: string): BlankDetail {
+  const error = new Error('未知错误（' + name + ' 未给出任何信息）') as BlankDetail
+  error.blankDetail = true
+  return error
+}
+function isBlankDetail(error: Error): error is BlankDetail {
+  return (error as Partial<BlankDetail>).blankDetail === true
 }
 
 function toValue(value: unknown): unknown {

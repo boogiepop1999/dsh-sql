@@ -15,5 +15,5 @@ export declare function toCsv(columns: string[], rows: unknown[][]): string;
 /** 构建工具定义；设置**每次调用现读**，adapters 按连接名缓存并按指纹失效。 */
 export declare function buildSqlTools(loadConfig: () => ResolvedSqlSettings): {
     tools: SqlToolDefinition[];
-    adapters: Map<string, DatabaseAdapter>;
+    adapters: ReadonlyMap<string, DatabaseAdapter>;
 };

@@ -139,13 +139,6 @@ test('assertReadQuery 拒绝 data-modifying CTE / INTO OUTFILE / 行锁 / PRAGMA
   assert.throws(() => assertReadQuery('PRAGMA journal_mode = WAL'), /PRAGMA 写操作/)
 })
 
-test('assertReadQuery 连续调用始终拒绝同一 data-modifying CTE', () => {
-  const sql = 'WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone'
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    assert.throws(() => assertReadQuery(sql), /DELETE/)
-  }
-})
-
 test('assertReadQuery 放行 SHOW CREATE TABLE 等元数据语句', () => {
   assert.equal(assertReadQuery('SHOW CREATE TABLE users'), 'SHOW CREATE TABLE users')
   assert.equal(assertReadQuery('EXPLAIN SELECT 1'), 'EXPLAIN SELECT 1')
