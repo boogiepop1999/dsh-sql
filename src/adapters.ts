@@ -41,6 +41,29 @@ function abortReason(signal: AbortSignal): unknown {
   return error
 }
 
+/**
+ * 把驱动抛出的错误转成「message 一定有内容」的错误。
+ *
+ * 驱动与 Node 有些情况下抛 `AggregateError` —— 例如 host 未给时 net 层同时试 IPv4/IPv6、
+ * 全部失败后聚合 —— 而它的 `message` 默认为空串，真正的错误躺在 `errors[]` 里。
+ * 原样抛出去，调用方（AI）只能看到一个空报错，无从判断是配置错还是网络不通。
+ */
+function describeDriverError(error: unknown): Error {
+  if (error instanceof AggregateError && error.errors.length > 0) {
+    const inner = error.errors.map((item) => describeDriverError(item).message).filter((text) => text !== '')
+    if (inner.length > 0) return new Error(inner.join('；'), { cause: error })
+  }
+  if (error instanceof Error) {
+    if (error.message !== '') return error
+    // message 为空时按 code / errno / syscall 拼一个，总比空字符串强。
+    const detail = [error.name, (error as { code?: unknown }).code, (error as { syscall?: unknown }).syscall]
+      .filter((part) => typeof part === 'string' && part !== '')
+      .join(' ')
+    return new Error(detail !== '' ? detail : '未知错误（驱动未给出信息）', { cause: error })
+  }
+  return new Error(String(error))
+}
+
 function toValue(value: unknown): unknown {
   if (typeof value === 'bigint') {
     if (value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -78,7 +101,7 @@ function streamMysqlQuery(corePool: { query(querySql: string): any }, sql: strin
     stream.on('fields', (fields: Array<{ name: string }>) => {
       columns = fields.map((field) => field.name)
     })
-    // Consume the Readable, otherwise mysql2 pauses forever at highWaterMark.
+    // 必须消费这个 Readable，否则 mysql2 会一直卡在 highWaterMark 上。
     stream.on('data', (row: Record<string, unknown>) => {
       if (settled) return
       if (columns.length === 0) columns = Object.keys(row)
@@ -86,7 +109,7 @@ function streamMysqlQuery(corePool: { query(querySql: string): any }, sql: strin
       if (rows.length >= limit) {
         finish()
         stream.destroy()
-        // mysql2 resumes its connection when only the Readable is destroyed.
+        // 只销毁 Readable 时，mysql2 会把连接放回池里继续用。
         discard()
       }
     })
@@ -95,7 +118,7 @@ function streamMysqlQuery(corePool: { query(querySql: string): any }, sql: strin
     stream.on('error', (error: unknown) => {
       if (settled) return
       settled = true
-      reject(error instanceof Error ? error : new Error(String(error)))
+      reject(describeDriverError(error))
     })
   })
 }
@@ -112,7 +135,7 @@ function streamPostgresQuery(client: pg.PoolClient, sql: string, limit: number, 
       if (columns.length === 0) columns = result?.fields.map((field) => field.name) ?? Object.keys(row)
       rows.push(columns.map((name) => toValue(row[name])))
       if (rows.length >= limit) {
-        // Closing this dedicated connection stops server work and prevents reuse.
+        // 关掉这条专用连接：既让服务端停止继续产出，也避免它被放回池里复用。
         settled = true
         discard()
         resolve({ columns, rows })
@@ -124,12 +147,11 @@ function streamPostgresQuery(client: pg.PoolClient, sql: string, limit: number, 
       if (columns.length === 0) columns = result.fields.map((field) => field.name)
       resolve({ columns, rows })
     })
-    // Keep this listener after reaching the cap: destroying the client can emit
-    // the driver's asynchronous connection-closed error on this active query.
+    // 达上限后仍保留此监听：销毁 client 时驱动可能在本次查询上抛出异步的连接关闭错误。
     query.on('error', (error) => {
       if (settled) return
       settled = true
-      reject(error)
+      reject(describeDriverError(error))
     })
     client.query(query)
   })
@@ -218,7 +240,8 @@ class MysqlAdapter implements DatabaseAdapter {
   }
   private async withSignalConnection<T>(signal: AbortSignal | undefined, work: (connection: mysql.PoolConnection, discard: () => void) => Promise<T>): Promise<T> {
     signal?.throwIfAborted()
-    const connection = await this.pool.getConnection()
+    // 取连接是连接失败的爆发点（host/端口/凭据错都在这里），转一手免得 message 为空。
+    const connection = await this.pool.getConnection().catch((error: unknown) => { throw describeDriverError(error) })
     let destroyed = false
     let rejectAbort: (reason: unknown) => void = () => {}
     const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject })
@@ -241,7 +264,9 @@ class MysqlAdapter implements DatabaseAdapter {
     }
   }
   private async queryRows(sql: string, signal?: AbortSignal): Promise<any> {
-    if (signal === undefined) return await this.pool.query(sql)
+    if (signal === undefined) {
+      return await this.pool.query(sql).catch((error: unknown) => { throw describeDriverError(error) })
+    }
     return await this.withSignalConnection(signal, async (connection) => await connection.query(sql))
   }
   async listTables(signal?: AbortSignal) {
@@ -296,7 +321,8 @@ class PostgresAdapter implements DatabaseAdapter {
   }
   private async withSignalClient<T>(signal: AbortSignal | undefined, work: (client: pg.PoolClient, discard: () => void) => Promise<T>): Promise<T> {
     signal?.throwIfAborted()
-    const client = await this.pool.connect()
+    // 取连接是连接失败的爆发点（host/端口/凭据错都在这里），转一手免得 message 为空。
+    const client = await this.pool.connect().catch((error: unknown) => { throw describeDriverError(error) })
     let destroyed = false
     let rejectAbort: (reason: unknown) => void = () => {}
     const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject })
@@ -322,7 +348,9 @@ class PostgresAdapter implements DatabaseAdapter {
     const run = async (client: { query(query: any, values?: unknown[]): Promise<any> }): Promise<any> => {
       return values === undefined ? await client.query(query) : await client.query(query, values)
     }
-    if (signal === undefined) return await run(this.pool)
+    if (signal === undefined) {
+      return await run(this.pool).catch((error: unknown) => { throw describeDriverError(error) })
+    }
     return await this.withSignalClient(signal, run)
   }
   async listTables(signal?: AbortSignal) {

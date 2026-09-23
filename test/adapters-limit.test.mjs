@@ -215,3 +215,45 @@ test('PostgreSQL：取消信号销毁专用连接', async () => {
   await assert.rejects(pending, /cancel postgres/)
   assert.equal(forcedRelease, true)
 })
+
+test('AggregateError 被展开：message 不会空着交给调用方', async () => {
+  // 真实场景：host 未给时 net 层同时试 IPv4/IPv6，全失败后聚合，
+  // 而 AggregateError 的 message 默认是空串 —— 原样抛出等于没报错。
+  const adapter = createAdapter({ name: 'pg', engine: 'postgres', host: 'h', port: 5432, user: 'u', password: 'p', database: 'app' })
+  adapter.pool = {
+    async connect() {
+      throw new AggregateError([
+        new Error('connect ECONNREFUSED ::1:5432'),
+        new Error('connect ECONNREFUSED 127.0.0.1:5432'),
+      ])
+    },
+  }
+  await assert.rejects(
+    () => adapter.query('SELECT 1', undefined, new AbortController().signal),
+    (error) => {
+      assert.notEqual(error.message, '', 'message 不能为空')
+      assert.match(error.message, /ECONNREFUSED ::1:5432/, 'IPv6 子错误要带出来')
+      assert.match(error.message, /ECONNREFUSED 127\.0\.0\.1:5432/, 'IPv4 子错误也要带出来')
+      return true
+    },
+  )
+})
+
+test('message 为空的 Error 会按 code / name 兜底出可读文本', async () => {
+  const adapter = createAdapter({ name: 'pg', engine: 'postgres', host: 'h', port: 5432, user: 'u', password: 'p', database: 'app' })
+  adapter.pool = {
+    async connect() {
+      const bare = new Error('')
+      bare.code = 'ECONNREFUSED'
+      throw bare
+    },
+  }
+  await assert.rejects(
+    () => adapter.query('SELECT 1', undefined, new AbortController().signal),
+    (error) => {
+      assert.notEqual(error.message, '', 'message 不能为空')
+      assert.match(error.message, /ECONNREFUSED/)
+      return true
+    },
+  )
+})
