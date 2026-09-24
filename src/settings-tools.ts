@@ -422,7 +422,7 @@ export function buildSettingsTools(): SqlToolDefinition[] {
   const sqlConnectionRemove: SqlToolDefinition = {
     name: 'sql_connection_remove',
     description:
-      '删除一个连接（连带关闭它的连接池）。\n' + CONFIG_WRITE_WARNING,
+      '删除一个连接（只改配置；已建的连接池留到进程退出，不影响使用）。\n' + CONFIG_WRITE_WARNING,
     parameters: compileParameters({
       name: { type: 'string', required: true, description: '连接名。' },
     }),
