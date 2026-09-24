@@ -8,13 +8,15 @@
 import {
   DESCRIPTION_MAX_LENGTH,
   missingConnectionFields,
-  resolveSettings,
+  fillConnectionKeys,
+  invalidReadOnly,
+  isReadOnly,
+  requireMaxRows,
   splitConnectionsByEnv,
-  type ResolvedSqlSettings,
   type SqlConnectionConfig,
   type SqlSettings,
 } from './config.js'
-import { loadSettings, saveSettings, settingsFile } from './settings.js'
+import { loadSettings, normalizeSettings, saveSettings, settingsFile } from './settings.js'
 import {
   CONFIG_WRITE_WARNING,
   compileParameters,
@@ -43,26 +45,23 @@ function isConnectionTable(value: unknown): value is Record<string, SqlConnectio
 }
 
 /** 读设置；坏了就把错误留给调用方（sql_settings 自己兜，写工具直接抛）。 */
-function current(): { settings: SqlSettings; resolved: ResolvedSqlSettings; file: string } {
+function current(): { settings: SqlSettings; file: string } {
   const loaded = loadSettings()
-  return { settings: loaded.settings, resolved: loaded.resolved, file: loaded.file }
+  return { settings: loaded.settings, file: loaded.file }
 }
 
 /**
- * 读 → 改 → 校验 → 原子写回。change 收到的是深拷贝，就地改完返回即可。
+ * 读 → 改 → 形状把关 → 原子写回。change 收到的是深拷贝，就地改完返回即可。
  *
- * 关键：**校验用 resolveSettings，写盘用 draft 本身**，两者不能合并成一步。
- *
- * `resolveSettings` 会给缺省字段兜底（如 file 补 `:memory:`、database 补 `''`），
- * 若把它的返回值拿去写盘，「传 null 清空某字段」会被兜底值悄悄填回来 —— 清空失效，
- * 而且不报错。所以它只用来**判合法性**，不参与落盘。
+ * **写盘前再过一遍 `normalizeSettings`**：change 是各工具自己写的，万一塞进未知字段
+ * 或把 `connections` 写成了别的形状，这一步会拦下/剔除，而不是把垃圾落进文件。
+ * 读写的都是同一份（normalizeSettings 的产物），所以拿它当底稿时"没提到的字段"
+ * 自然原样保留 —— 增量语义不受影响。
  */
 function mutate(change: (draft: SqlSettings) => SqlSettings): { settings: SqlSettings; file: string } {
   const { settings, file } = current()
   const draft = JSON.parse(JSON.stringify(settings)) as SqlSettings
-  const next = change(draft)
-  // 权威校验：字段非法在这里抛错，不落盘。
-  resolveSettings(next)
+  const next = normalizeSettings(change(draft))
   saveSettings(next, undefined)
   return { settings: next, file: settingsFile() }
 }
@@ -105,27 +104,44 @@ export function buildSettingsTools(): SqlToolDefinition[] {
         return { report: lines.join('\n') }
       }
 
-      const { activeEnv, environments, connections: allConnections } = loaded.resolved
-      const { available: inScope, excluded: outOfScope } = splitConnectionsByEnv(loaded.resolved)
+      const allConnections = loaded.settings.connections ?? {}
+      const { available: inScope, excluded: outOfScope } = splitConnectionsByEnv(loaded.settings)
+      // 设置里的字段都是可选的（手写文件可能缺），这里统一成"空串 / 空数组"再渲染
+      const activeEnv = typeof loaded.settings.activeEnv === 'string' ? loaded.settings.activeEnv.trim() : ''
+      const environments = Array.isArray(loaded.settings.environments) ? loaded.settings.environments : []
 
       const head = activeEnv !== '' ? '当前环境 ' + activeEnv : '当前环境（未设置）'
-      lines.push('# dsh-sql — ' + head + '，' + String(inScope.length) + ' 个可见连接')
+      lines.push('# dsh-sql — ' + head + '，' + String(Object.keys(inScope).length) + ' 个可见连接')
       lines.push('')
       lines.push('## 可见连接' + (activeEnv !== '' ? '（当前环境 ' + activeEnv + '）' : '（不限环境）'))
       lines.push('| 连接名 | 引擎 | 环境 | 只读 | 描述 |')
       lines.push('| --- | --- | --- | --- | --- |')
-      for (const connection of inScope) {
+      for (const [name, connection] of Object.entries(inScope)) {
+        // 非法 readOnly 值就地标出来：生效值已按只读算，但"为什么写不了"得让人看见
+        const readOnlyCell = invalidReadOnly(connection) !== undefined
+          ? '🔒 是（值非法，按只读）'
+          : (isReadOnly(connection) ? '🔒 是' : '否')
         lines.push(
-          '| ' + cell(connection.name) +
+          '| ' + cell(name) +
           ' | ' + cell(connection.engine) +
-          ' | ' + cell(connection.env ?? '（无）') +
-          ' | ' + (connection.readOnly === true ? '🔒 是' : '否') +
+          ' | ' + cell(connection.env ?? '不限环境') +
+          ' | ' + readOnlyCell +
           ' | ' + cell(connection.description ?? '') + ' |',
         )
       }
-      if (outOfScope.length > 0) {
+      const outOfScopeNames = Object.keys(outOfScope)
+      if (outOfScopeNames.length > 0) {
         lines.push('')
-        lines.push('其它环境的连接：' + outOfScope.map((conn) => conn.name).join('、'))
+        lines.push('其它环境的连接：' + outOfScopeNames.join('、'))
+      }
+
+      // 行数上限非法时报告还得打得开 —— 这正是 sql_settings 的职责（让人看见问题），
+      // 所以这里兜错误而不是让它抛。
+      let maxRowsText: string
+      try {
+        maxRowsText = String(requireMaxRows(loaded.settings))
+      } catch (error) {
+        maxRowsText = '⚠ ' + (error instanceof Error ? error.message : String(error))
       }
 
       lines.push('')
@@ -134,13 +150,25 @@ export function buildSettingsTools(): SqlToolDefinition[] {
       lines.push('| --- | --- |')
       lines.push('| 当前环境 | ' + (activeEnv !== '' ? cell(activeEnv) : '（未设置）') + ' |')
       lines.push('| 环境清单 | ' + (environments.length > 0 ? environments.map(cell).join('、') : '（空）') + ' |')
-      lines.push('| 行数上限 | ' + String(loaded.resolved.maxRows) + ' |')
+      lines.push('| 行数上限 | ' + cell(maxRowsText) + ' |')
       lines.push('| 配置文件 | `' + cell(loaded.file) + '` |')
 
       const problems: string[] = []
       if (environments.length === 0) problems.push('environments 为空，请先用 sql_config_set 配置环境清单。')
       if (activeEnv === '') problems.push('activeEnv 未设置，请先用 sql_config_set 指定当前环境。')
-      if (allConnections.length === 0) problems.push('还没有任何连接，请先用 sql_connection_set 添加。')
+      if (Object.keys(allConnections).length === 0) problems.push('还没有任何连接，请先用 sql_connection_set 添加。')
+      // maxRows 非法：使用处（sql_query）会直接报错，这里先提一句，免得"查询全挂"来得突然
+      if (maxRowsText.startsWith('⚠ ')) problems.push(maxRowsText.slice(2))
+      // readOnly 值非法：生效值已按只读算（fail-safe），但必须说出来 ——
+      // 否则表现只是"莫名其妙写不了"，没人想得到是值写错了。
+      for (const [name, connection] of Object.entries(allConnections)) {
+        const bad = invalidReadOnly(connection)
+        if (bad === undefined) continue
+        problems.push(
+          '连接 "' + name + '" 的 readOnly 值非法（' + JSON.stringify(bad) +
+          '），已按 true（只读）处理。要开写请改成布尔 false（用 sql_connection_set，或直接编辑配置文件）。',
+        )
+      }
       if (problems.length > 0) {
         lines.push('')
         lines.push('## ⚠ 问题')
@@ -260,7 +288,7 @@ export function buildSettingsTools(): SqlToolDefinition[] {
   const sqlConnectionSet: SqlToolDefinition = {
     name: 'sql_connection_set',
     description:
-      '新增或覆盖一个连接。**未给的字段保持不变；给了就设为该值**。先 sql_settings 看现值。\n' +
+      '新增或更新一个连接。**未给的字段保持不变；给了就设为该值**。先 sql_settings 看现值。\n' +
       CONFIG_WRITE_WARNING,
     parameters: compileParameters({
       name: { type: 'string', required: true, description: '连接名。' },
@@ -271,7 +299,7 @@ export function buildSettingsTools(): SqlToolDefinition[] {
       user: { type: 'string', description: '用户名。' },
       password: { type: 'string', description: '密码。' },
       database: { type: 'string', description: '库名。' },
-      readOnly: { type: 'boolean', description: '禁用该连接的写操作，默认 false。' },
+      readOnly: { type: 'boolean', description: '是否禁用该连接的写操作。**默认 true **。' },
       env: { type: 'string', description: '所属环境（如 qa / prod）。留空表示不限定环境。' },
       description: { type: 'string', description: '连接说明，最长 ' + DESCRIPTION_MAX_LENGTH + ' 字符。' },
     }),
@@ -285,7 +313,9 @@ export function buildSettingsTools(): SqlToolDefinition[] {
       const table = isConnectionTable(settings.connections) ? settings.connections : {}
       const existing = Object.hasOwn(table, name) ? table[name] : undefined
 
-      // 引擎：给了用给的，否则沿用已有的；都没有（即新建）则必填。
+      // 引擎：新建时必填；**已有连接不许改引擎** —— 换引擎等于把一条连接变成另一条
+      // （sqlite 的 file 与 mysql 的 host/port/… 是两套完全不同的字段），
+      // 与其悄悄删掉一半字段，不如让人删掉重建：名字相同、配置却是另一套，最容易踩坑。
       const engineRaw = args.engine
       let engine: SqlConnectionConfig['engine']
       if (typeof engineRaw === 'string' && engineRaw.trim() !== '') {
@@ -297,6 +327,12 @@ export function buildSettingsTools(): SqlToolDefinition[] {
         engine = existing.engine
       } else {
         throw new Error('新建连接必须给 engine（sqlite / mysql / postgres）。')
+      }
+      if (existing !== undefined && engine !== existing.engine) {
+        throw new Error(
+          '连接 "' + name + '" 已是 ' + existing.engine + '，不能改成 ' + engine +
+          '。换引擎请用 sql_connection_remove 删掉重建（用 sql_connection_set 新建同名连接）。',
+        )
       }
 
       // 以现有定义为底稿做增量修改：更新时保留未提及的字段（尤其 password，绝不能因
@@ -318,8 +354,7 @@ export function buildSettingsTools(): SqlToolDefinition[] {
           throw new Error('description 最长 ' + DESCRIPTION_MAX_LENGTH + ' 字符，收到 ' + text.length + ' 字符。')
         }
         base[key] = text
-      }
-      /** port 是数字，单独处理；只收真正的正整数。 */
+      }      /** port 是数字，单独处理；只收真正的正整数。 */
       const applyPort = (): void => {
         const value = args.port
         if (value === undefined) return
@@ -328,7 +363,7 @@ export function buildSettingsTools(): SqlToolDefinition[] {
         }
         base.port = value
       }
-      /** readOnly 是布尔，单独处理；非布尔一律报错 —— 静默转成 false 会让「想开只读」变成可写。 */
+      /** readOnly 是布尔，单独处理；非布尔一律报错 —— 传 "false" 之类会被解析侧按 true 吞掉（fail-safe），当场报错比让写入静默失败好。 */
       const applyReadOnly = (): void => {
         const value = args.readOnly
         if (value === undefined) return
@@ -348,20 +383,14 @@ export function buildSettingsTools(): SqlToolDefinition[] {
       applyPort()
       applyReadOnly()
 
+      // 引擎不可变（上面已拦），所以这里不需要再按引擎清理另一套字段。
       const entry: SqlConnectionConfig = { ...base, engine }
-      // 换引擎时清掉另一套字段，避免残留（如 sqlite→mysql 后还留着 file）。
-      if (engine === 'sqlite') {
-        delete entry.host
-        delete entry.port
-        delete entry.user
-        delete entry.password
-        delete entry.database
-      } else {
-        delete entry.file
-      }
 
       // —— 写入前校验（读取侧不校验，这里是唯一把关点）——
       // 规则在 missingConnectionFields 里（与建连侧共用），这里只负责措辞。
+      // 新增要求各字段 key 都落下：**不报错、直接补空**（见 fillConnectionKeys），
+      // 所以它排在必填校验**之前** —— 先把 key 补全，再看值够不够。
+      if (existing === undefined) fillConnectionKeys(entry)
       const missing = missingConnectionFields(entry)
       if (missing.length > 0) {
         throw new Error('连接 "' + name + '"（' + engine + '）缺少必填字段：' + missing.join('、') + '。请用 sql_connection_set 补全。')

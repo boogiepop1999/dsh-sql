@@ -3,11 +3,12 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildSqlTools, resolveSettings, toCsv } from '../lib/index.js'
+import { buildSqlTools, toCsv } from '../lib/index.js'
 
 function makeTools() {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-stats-'))
-  const cfg = resolveSettings({ connections: { local: { engine: 'sqlite', file: join(dir, 'stats.db') } }, maxRows: 100 })
+  // 用例要往库里建表灌数据，所以显式 readOnly: false（不写的话默认只读）
+  const cfg = ({ connections: { local: { engine: 'sqlite', file: join(dir, 'stats.db'), readOnly: false } }, maxRows: 100 })
   const { tools } = buildSqlTools(() => cfg)
   const exec = tools.find((t) => t.name === 'sql_exec')
   return { tools, exec }
@@ -95,7 +96,7 @@ test('sql_health：只探活，不含全局设置', async () => {
 })
 
 test('sql_health：坏连接报 ok=false 且错误可读', async () => {
-  const cfg = resolveSettings({ connections: { bad: { engine: 'mysql', host: '127.0.0.1', port: 1, database: 'x', user: 'u', password: 'p' } }, maxRows: 10, queryTimeoutMs: 5000, execTimeoutMs: 5000 })
+  const cfg = ({ connections: { bad: { engine: 'mysql', host: '127.0.0.1', port: 1, database: 'x', user: 'u', password: 'p' } }, maxRows: 10, queryTimeoutMs: 5000, execTimeoutMs: 5000 })
   const { tools } = buildSqlTools(() => cfg)
   const health = tools.find((t) => t.name === 'sql_health')
   const value = await health.execute({})
@@ -106,7 +107,7 @@ test('sql_health：坏连接报 ok=false 且错误可读', async () => {
 
 test('sql_health：多连接并发探活，结果按配置顺序返回', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-ping-'))
-  const cfg = resolveSettings({
+  const cfg = ({
     connections: {
       a: { engine: 'sqlite', file: join(dir, 'a.db') },
       b: { engine: 'sqlite', file: join(dir, 'b.db') },
@@ -129,7 +130,7 @@ test('sql_health：多连接并发探活，结果按配置顺序返回', async (
 
 test('sql_health：只探在 activeEnv 下可见的连接', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-ping-env-'))
-  const cfg = resolveSettings({
+  const cfg = ({
     activeEnv: 'qa',
     environments: ['qa', 'pro'],
     connections: {
@@ -153,7 +154,7 @@ test('sql_health：只探在 activeEnv 下可见的连接', async () => {
 
 test('sql_health：activeEnv 为空时只探不限环境的', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-ping-noenv-'))
-  const cfg = resolveSettings({
+  const cfg = ({
     environments: ['qa', 'pro'],
     connections: {
       'qa-db': { engine: 'sqlite', file: join(dir, 'qa.db'), env: 'qa' },
@@ -169,7 +170,7 @@ test('sql_health：activeEnv 为空时只探不限环境的', async () => {
 })
 
 test('sql_health：activeEnv 下没有可见连接时给指引而不是「全部正常」', async () => {
-  const cfg = resolveSettings({
+  const cfg = ({
     activeEnv: 'qa',
     environments: ['qa', 'pro'],
     connections: { 'pro-db': { engine: 'sqlite', file: ':memory:', env: 'pro' } },
@@ -201,7 +202,7 @@ test('sql_schema：查不存在的表说「不存在」，不能说成「0 张�
 })
 
 test('sql_stats：表数用 tableCount 且失败原因要显式给出', async () => {
-  const cfg = resolveSettings({ connections: { local: { engine: 'sqlite', file: ':memory:' } } })
+  const cfg = ({ connections: { local: { engine: 'sqlite', file: ':memory:' } } })
   const { tools } = buildSqlTools(() => cfg)
   const stats = tools.find((t) => t.name === 'sql_stats')
 

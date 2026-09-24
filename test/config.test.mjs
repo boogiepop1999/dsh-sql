@@ -1,10 +1,13 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  resolveSettings,
   assertIdentifier,
   passwordEnvName,
+  isReadOnly,
+  invalidReadOnly,
+  requireMaxRows,
   splitConnectionsByEnv,
+  normalizeSettings,
   queryTimeoutError,
   execTimeoutError,
   isAbortError,
@@ -13,129 +16,111 @@ import {
   STATS_TIMEOUT_MS,
 } from '../lib/index.js'
 
-/** 解析后的连接按名字取（字典 → 列表，列表元素带 name）。 */
-const byName = (cfg, name) => cfg.connections.find((conn) => conn.name === name)
+// 这一份测的是**纯函数**：设置怎么读进来（normalizeSettings）、
+// 以及运行时怎么取值（isReadOnly / requireMaxRows / splitConnectionsByEnv）。
+// 以前这里有一整套 resolveSettings 的用例；那一层已删除，行为搬到了使用处。
+// 「使用处」的行为由 tools.test.mjs / settings-tools.test.mjs 覆盖。
 
-test('空配置不补任何连接（由 sql_settings 告警指路）', () => {
-  const cfg = resolveSettings({})
-  assert.equal(cfg.connections.length, 0)
-  assert.equal(cfg.maxRows, 1000)
-  assert.equal(cfg.activeEnv, '')
-  assert.deepEqual(cfg.environments, [])
-})
-
-test('多连接解析 + 密码环境变量回退', () => {
-  const cfg = resolveSettings({
-    connections: {
-      local: { engine: 'sqlite', file: './x.db' },
-      prod: { engine: 'postgres', host: 'db.internal', port: 5432, user: 'u', database: 'app' },
-    },
-  }, { DSH_SQL_PASSWORD_PROD: 'secret123' })
-  assert.equal(cfg.connections.length, 2)
-  const prod = byName(cfg, 'prod')
-  assert.equal(prod.port, 5432)
-  assert.equal(prod.password, 'secret123', '密码走 DSH_SQL_PASSWORD_<NAME> 回退')
-  assert.equal(passwordEnvName('my-db'), 'DSH_SQL_PASSWORD_MY_DB')
-})
-
-test('读取侧不补默认值：缺什么就没有什么', () => {
-  const cfg = resolveSettings({
-    connections: {
-      // 全都不给：不该冒出 localhost / 3306 / '' 这类凭空造出的值
-      bare: { engine: 'mysql' },
-      // sqlite 不给 file 也不该变成 :memory:
-      sq: { engine: 'sqlite' },
-    },
+test('normalizeSettings：只查顶层形状 + 剔未知字段', () => {
+  const out = normalizeSettings({
+    activeEnv: 'qa',
+    environments: ['qa'],
+    connections: { a: { engine: 'sqlite', file: ':memory:' } },
+    maxRows: 500,
+    unknownTop: '丢掉',
   })
-  const bare = byName(cfg, 'bare')
-  assert.equal(bare.host, undefined)
-  assert.equal(bare.port, undefined)
-  assert.equal(bare.user, undefined)
-  assert.equal(bare.database, undefined)
-  assert.equal(bare.password, undefined)
-  assert.equal(byName(cfg, 'sq').file, undefined)
+  assert.equal(out.activeEnv, 'qa')
+  assert.deepEqual(out.environments, ['qa'])
+  assert.equal(out.maxRows, 500)
+  assert.equal(out.unknownTop, undefined, '未知顶层字段被剔除')
+  // 连接内部的字段**一概不动** —— 没有 trim、没有类型过滤、不补默认值
+  assert.deepEqual(out.connections.a, { engine: 'sqlite', file: ':memory:' })
 })
 
-test('字典的键即连接名（区分大小写）', () => {
-  const cfg = resolveSettings({
-    connections: {
-      qa: { engine: 'sqlite', file: ':memory:' },
-      QA: { engine: 'sqlite', file: ':memory:' },
-    },
-  })
-  assert.equal(cfg.connections.length, 2, '大小写不同视为两条')
-  assert.ok(byName(cfg, 'qa') !== undefined)
-  assert.ok(byName(cfg, 'QA') !== undefined)
+test('normalizeSettings：connections 缺失兜底成空对象', () => {
+  // 下游到处写 settings.connections[name]，undefined 会直接崩
+  assert.deepEqual(normalizeSettings({}).connections, {})
+  assert.deepEqual(normalizeSettings({ activeEnv: 'qa' }).connections, {})
 })
 
-test('读取侧不校验：非法配置也原样读出（校验在写入工具）', () => {
-  // 这些以前会抛错，现在读取侧一律放行 —— 配置错了不该让插件整体崩掉。
-  assert.doesNotThrow(() => resolveSettings({ connections: { x: { engine: 'oracle' } } }))
-  assert.doesNotThrow(() => resolveSettings({ connections: { a: { engine: 'postgres' } } }))
-  assert.doesNotThrow(() => resolveSettings({ maxRows: -1 }))
-  assert.doesNotThrow(() => resolveSettings({ environments: 'not-an-array' }))
+test('normalizeSettings：顶层不是对象 / connections 不是对象都报错', () => {
+  assert.throws(() => normalizeSettings(null), /顶层必须是一个对象/)
+  assert.throws(() => normalizeSettings([]), /顶层必须是一个对象/)
+  assert.throws(() => normalizeSettings('x'), /顶层必须是一个对象/)
+  assert.throws(() => normalizeSettings({ connections: [] }), /connections 必须是一个对象/)
+  assert.throws(() => normalizeSettings({ environments: 'nope' }), /environments 必须是一个数组/)
 })
 
-test('database 读取侧不强制：缺了就缺着，由 sql_connection_set 把关', () => {
-  const mysql = resolveSettings({ connections: { my: { engine: 'mysql', host: 'db' } } })
-  assert.equal(byName(mysql, 'my').database, undefined, '不再补成空串')
-  const withDb = resolveSettings({ connections: { my: { engine: 'mysql', host: 'db', database: 'app' } } })
-  assert.equal(byName(withDb, 'my').database, 'app')
-  const pg = resolveSettings({ connections: { pg: { engine: 'postgres', host: 'db' } } })
-  assert.equal(byName(pg, 'pg').database, undefined, '读取侧不拦，由 sql_connection_set 把关')
-})
-
-test('连接级 readOnly 与 description', () => {
-  const cfg = resolveSettings({
-    connections: {
-      qa: { engine: 'sqlite', file: ':memory:' },
-      prod: { engine: 'sqlite', file: ':memory:', readOnly: true, description: '  生产库，慎写  ' },
-    },
-  })
-  assert.equal(byName(cfg, 'qa').readOnly, false, '默认可写')
-  assert.equal(byName(cfg, 'qa').description, undefined)
-  assert.equal(byName(cfg, 'prod').readOnly, true)
-  assert.equal(byName(cfg, 'prod').description, '生产库，慎写', '首尾空白应被去掉')
-})
-
-test('description 读取侧不截断也不校验（长度由写入侧把关）', () => {
+test('normalizeSettings：不做归一化（无 trim、无默认值、不校验）', () => {
   const long = 'x'.repeat(150)
-  const cfg = resolveSettings({ connections: { a: { engine: 'sqlite', file: ':memory:', description: long } } })
-  assert.equal(byName(cfg, 'a').description, long, '原样读出，不截断')
-})
-
-test('env 读取侧归一：空串不写入', () => {
-  const cfg = resolveSettings({
+  const out = normalizeSettings({
+    activeEnv: '  qa  ',
     connections: {
-      a: { engine: 'sqlite', env: 'qa' },
-      b: { engine: 'sqlite', env: '  ' },
+      a: { engine: 'oracle' },                          // 非法引擎也原样读出
+      b: { engine: 'sqlite', env: '  ', description: long, readOnly: 'true' },
     },
   })
-  assert.equal(byName(cfg, 'a').env, 'qa')
-  assert.equal(byName(cfg, 'b').env, undefined)
+  assert.equal(out.activeEnv, '  qa  ', '不 trim —— 读到的就是文件里的')
+  assert.equal(out.connections.a.engine, 'oracle', '不校验引擎')
+  assert.equal(out.connections.b.env, '  ', '不 trim')
+  assert.equal(out.connections.b.description, long, '不截断')
+  assert.equal(out.connections.b.readOnly, 'true', '类型也原样保留')
 })
 
-test('environments 读取侧去重去空', () => {
-  const cfg = resolveSettings({ environments: ['qa', 'qa', '', '  ', 'prod'] })
-  assert.deepEqual(cfg.environments, ['qa', 'prod'])
+test('normalizeSettings：maxRows 非法不在这里抛（由 requireMaxRows 把关）', () => {
+  assert.doesNotThrow(() => normalizeSettings({ maxRows: -1 }))
+  assert.doesNotThrow(() => normalizeSettings({ maxRows: 'x' }))
 })
 
-test('activeEnv 读取侧 trim，缺省为空串', () => {
-  assert.equal(resolveSettings({}).activeEnv, '')
-  assert.equal(resolveSettings({ activeEnv: '  qa  ' }).activeEnv, 'qa')
+test('isReadOnly：只有显式 false 才可写，其余一律只读（fail-safe）', () => {
+  assert.equal(isReadOnly({ engine: 'sqlite', readOnly: false }), false, '显式 false 才放行')
+  assert.equal(isReadOnly({ engine: 'sqlite', readOnly: true }), true)
+  assert.equal(isReadOnly({ engine: 'sqlite' }), true, '缺省就是只读')
+  // 认不出来的值全部当只读 —— 写权限是危险的那一侧
+  assert.equal(isReadOnly({ engine: 'sqlite', readOnly: 'false' }), true, '"false" 字符串不算')
+  assert.equal(isReadOnly({ engine: 'sqlite', readOnly: 'true' }), true)
+  assert.equal(isReadOnly({ engine: 'sqlite', readOnly: 0 }), true)
+  assert.equal(isReadOnly({ engine: 'sqlite', readOnly: 1 }), true)
+  assert.equal(isReadOnly({ engine: 'sqlite', readOnly: null }), true)
+  assert.equal(isReadOnly(undefined), true, '连接都没有也算只读')
+})
+
+test('invalidReadOnly：只标真正的非法值，缺省不算', () => {
+  assert.equal(invalidReadOnly({ engine: 'sqlite' }), undefined, '缺省是有意的默认')
+  assert.equal(invalidReadOnly({ engine: 'sqlite', readOnly: true }), undefined)
+  assert.equal(invalidReadOnly({ engine: 'sqlite', readOnly: false }), undefined)
+  // 非法值：原样返回，供 sql_settings 展示
+  assert.equal(invalidReadOnly({ engine: 'sqlite', readOnly: 'true' }), 'true')
+  assert.equal(invalidReadOnly({ engine: 'sqlite', readOnly: 'false' }), 'false')
+  assert.equal(invalidReadOnly({ engine: 'sqlite', readOnly: 1 }), 1)
+  assert.equal(invalidReadOnly({ engine: 'sqlite', readOnly: null }), null)
+  assert.equal(invalidReadOnly(undefined), undefined)
+})
+
+test('requireMaxRows：缺省 1000；非法直接报错（不静默夹取）', () => {
+  assert.equal(requireMaxRows({}), 1000)
+  assert.equal(requireMaxRows({ maxRows: 250 }), 250)
+  assert.equal(requireMaxRows({ maxRows: 1 }), 1)
+  assert.equal(requireMaxRows({ maxRows: 10000 }), 10000)
+
+  // 超范围 / 非整数 / 非数字都报错 —— 夹取会让人以为"设了 50000"实际跑 10000
+  assert.throws(() => requireMaxRows({ maxRows: 999999 }), /1~10000 之间的整数/)
+  assert.throws(() => requireMaxRows({ maxRows: 0 }), /1~10000 之间的整数/)
+  assert.throws(() => requireMaxRows({ maxRows: -1 }), /1~10000 之间的整数/)
+  assert.throws(() => requireMaxRows({ maxRows: 1.5 }), /1~10000 之间的整数/)
+  assert.throws(() => requireMaxRows({ maxRows: '500' }), /1~10000 之间的整数/)
+  assert.throws(() => requireMaxRows({ maxRows: true }), /1~10000 之间的整数/)
+  // 报错要指明怎么改
+  assert.throws(() => requireMaxRows({ maxRows: 999999 }), /sql_config_set/)
 })
 
 test('超时是代码常量，不进设置文件也不被解析', () => {
   assert.equal(QUERY_TIMEOUT_MS, 30000)
   assert.equal(EXEC_TIMEOUT_MS, 30000)
   assert.equal(STATS_TIMEOUT_MS, 120000)
-  const cfg = resolveSettings({ queryTimeoutMs: 7000, execTimeoutMs: 9999999 })
-  assert.equal(cfg.queryTimeoutMs, undefined, '设置文件里的超时字段被忽略')
-  assert.equal(cfg.execTimeoutMs, undefined)
-})
-
-test('maxRows 钳制到 10000', () => {
-  assert.equal(resolveSettings({ maxRows: 999999 }).maxRows, 10000)
+  const out = normalizeSettings({ queryTimeoutMs: 7000, execTimeoutMs: 9999999 })
+  assert.equal(out.queryTimeoutMs, undefined, '设置文件里的超时字段被剔除')
+  assert.equal(out.execTimeoutMs, undefined)
 })
 
 test('超时提示：查询可有限重试，写操作一律禁止重试', () => {
@@ -186,8 +171,16 @@ test('assertIdentifier 防注入', () => {
   assert.throws(() => assertIdentifier('a b', '表名'), /非法/)
 })
 
+test('passwordEnvName：连接名 → 环境变量名', () => {
+  assert.equal(passwordEnvName('my-db'), 'DSH_SQL_PASSWORD_MY_DB')
+  assert.equal(passwordEnvName('polar'), 'DSH_SQL_PASSWORD_POLAR')
+})
+
+// ── splitConnectionsByEnv ────────────────────────────────────────────────
+// 现在直接收设置本体（不再有"解析后"的中间形状）
+
 test('splitConnectionsByEnv：当前环境的 + 未标环境的可用，其它环境排除', () => {
-  const cfg = resolveSettings({
+  const { available, excluded } = splitConnectionsByEnv({
     activeEnv: 'qa',
     environments: ['qa', 'pro'],
     connections: {
@@ -197,13 +190,12 @@ test('splitConnectionsByEnv：当前环境的 + 未标环境的可用，其它�
       'blank-env': { engine: 'sqlite', env: '   ' },
     },
   })
-  const { available, excluded } = splitConnectionsByEnv(cfg)
-  assert.deepEqual(available.map((c) => c.name), ['qa-db', 'common', 'blank-env'])
-  assert.deepEqual(excluded.map((c) => c.name), ['pro-db'])
+  assert.deepEqual(Object.keys(available), ['qa-db', 'common', 'blank-env'])
+  assert.deepEqual(Object.keys(excluded), ['pro-db'])
 })
 
 test('splitConnectionsByEnv：activeEnv 为空时只有不限环境的可用', () => {
-  const cfg = resolveSettings({
+  const { available, excluded } = splitConnectionsByEnv({
     environments: ['qa', 'pro'],
     connections: {
       'qa-db': { engine: 'sqlite', env: 'qa' },
@@ -211,17 +203,27 @@ test('splitConnectionsByEnv：activeEnv 为空时只有不限环境的可用', (
       common: { engine: 'sqlite' },
     },
   })
-  const { available, excluded } = splitConnectionsByEnv(cfg)
-  assert.deepEqual(available.map((c) => c.name), ['common'], '没设环境 → 只有不限环境的')
-  assert.deepEqual(excluded.map((c) => c.name), ['qa-db', 'pro-db'], '带环境的一律算其它环境')
+  assert.deepEqual(Object.keys(available), ['common'], '没设环境 → 只有不限环境的')
+  assert.deepEqual(Object.keys(excluded), ['qa-db', 'pro-db'], '带环境的一律算其它环境')
 })
 
-test('splitConnectionsByEnv：环境名区分大小写', () => {
-  const cfg = resolveSettings({
+test('splitConnectionsByEnv：环境名区分大小写；activeEnv 会 trim', () => {
+  const upper = splitConnectionsByEnv({
     activeEnv: 'QA',
     connections: { 'qa-db': { engine: 'sqlite', env: 'qa' } },
   })
-  const { available, excluded } = splitConnectionsByEnv(cfg)
-  assert.deepEqual(available, [], 'QA ≠ qa')
-  assert.deepEqual(excluded.map((c) => c.name), ['qa-db'])
+  assert.deepEqual(Object.keys(upper.available), [], 'QA ≠ qa')
+  assert.deepEqual(Object.keys(upper.excluded), ['qa-db'])
+
+  const padded = splitConnectionsByEnv({
+    activeEnv: '  qa  ',
+    connections: { 'qa-db': { engine: 'sqlite', env: 'qa' } },
+  })
+  assert.deepEqual(Object.keys(padded.available), ['qa-db'], 'activeEnv 两侧空白应被忽略')
+})
+
+test('splitConnectionsByEnv：connections 缺失时返回两个空表，不崩', () => {
+  const { available, excluded } = splitConnectionsByEnv({ activeEnv: 'qa' })
+  assert.deepEqual(available, {})
+  assert.deepEqual(excluded, {})
 })

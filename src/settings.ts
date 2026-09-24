@@ -8,7 +8,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { resolveSettings, type SqlSettings, type SqlConnectionConfig, type ResolvedSqlSettings } from './config.js'
+import { type SqlSettings, type SqlConnectionConfig } from './config.js'
 
 /** 设置文件名。 */
 export const SETTINGS_FILE_NAME = 'settings.json'
@@ -42,10 +42,17 @@ export function writeJsonAtomic(file: string, value: unknown): void {
 }
 
 /**
- * 规范化设置：只保留已知字段。
+ * 规范化设置：**只查顶层形状 + 剔未知字段**，不管内部字段的对错。
  *
- * 返回的是**剔除未知字段后的原值**，不是 `resolveSettings` 的结果 —— 后者会把字段
- * 归一化（trim、类型过滤），拿它写盘会让「不传=不动」的部分更新语义失真。
+ * 读与写都走这一份 —— **没有 trim、没有类型过滤、不补默认值**。这样"读到的"就是
+ * "写入的"，不存在两套形状不同的数据（早先这里还有个 `resolveSettings` 专门给运行时
+ * 做归一化，导致同一个文件读出来两个样子，已删）。
+ *
+ * 唯一替下游兜的是 `connections` 缺失时补 `{}` —— 下游到处写 `settings.connections[name]`，
+ * undefined 会直接崩。
+ *
+ * 其余字段的兜底/校验都在**使用处**：`isReadOnly()` 按 fail-safe 判只读、
+ * `requireMaxRows()` 校验行数上限、`resolveConnection()` 合流密码环境变量。
  */
 export function normalizeSettings(raw: unknown): SqlSettings {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
@@ -63,6 +70,9 @@ export function normalizeSettings(raw: unknown): SqlSettings {
       throw new Error('connections 必须是一个对象（键即连接名）。')
     }
     out.connections = source.connections as Record<string, SqlConnectionConfig>
+  } else {
+    // 缺失时兜底成空对象 —— 下游到处写 `settings.connections[name]`，undefined 会直接崩
+    out.connections = {}
   }
   if (source.maxRows !== undefined) out.maxRows = source.maxRows as number
   return out
@@ -80,9 +90,8 @@ export function defaultSettings(): SqlSettings {
 
 /** 读设置的结果。 */
 export interface LoadedSettings {
+  /** 设置本体 —— **读用它、写也用它，只有这一份**（没有第二套"解析后"的结果）。 */
   settings: SqlSettings
-  /** 解析后的权威设置（归一化后的连接列表与钳制后的数值）。 */
-  resolved: ResolvedSqlSettings
   file: string
   /** 本次调用是否新建了文件（首次生成出厂设置）。 */
   created: boolean
@@ -100,7 +109,7 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): LoadedSettin
   if (!existsSync(file)) {
     const seeded = defaultSettings()
     writeJsonAtomic(file, seeded)
-    return { settings: seeded, resolved: resolveSettings(seeded, env), file, created: true }
+    return { settings: seeded, file, created: true }
   }
 
   let text: string
@@ -120,8 +129,7 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): LoadedSettin
     )
   }
 
-  const settings = normalizeSettings(parsed)
-  return { settings, resolved: resolveSettings(settings, env), file, created: false }
+  return { settings: normalizeSettings(parsed), file, created: false }
 }
 
 /** 原子写回设置。调用方负责先 `normalizeSettings` 校验。 */

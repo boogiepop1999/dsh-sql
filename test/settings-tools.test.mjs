@@ -23,9 +23,36 @@ function makeSandbox() {
   }
 }
 
-/** 建一个 sqlite 连接（部分更新语义：只给必要的字段）。 */
+/**
+ * 建一个连接的**完整**参数（新建用）。
+ *
+ * 新建时每个适用字段的 key 都必须给出来（值可以是空串，但不能不传），
+ * 所以这里按引擎铺上全部 key，调用方用 overrides 覆盖成想要的取值。
+ *
+ * 编辑场景**不要**用这个 —— 那里是「不传=不动」，用 partialArgs 更能表达意图。
+ */
 function connArgs(overrides = {}) {
-  return { name: 'x', engine: 'sqlite', file: ':memory:', ...overrides }
+  const engine = overrides.engine ?? 'sqlite'
+  const base = engine === 'sqlite'
+    ? { name: 'x', engine: 'sqlite', file: ':memory:', env: '', description: '', readOnly: false }
+    : {
+        name: 'x',
+        engine,
+        host: 'h',
+        port: engine === 'postgres' ? 5432 : 3306,
+        user: '',
+        password: '',
+        database: '',
+        env: '',
+        description: '',
+        readOnly: false,
+      }
+  return { ...base, ...overrides }
+}
+
+/** 编辑用的**部分**参数：只给要改的字段（新建不许这么传）。 */
+function partialArgs(overrides = {}) {
+  return { name: 'x', ...overrides }
 }
 
 test('四个工具都注册且名字正确', () => {
@@ -144,9 +171,10 @@ test('sql_connection_set：必填项按引擎区分（mysql 不要 database，po
         return true
       },
     )
-    // mysql 只要 host、port —— 不指定默认库也能用全限定名查询
-    await box.tool('sql_connection_set').execute({ name: 'my', engine: 'mysql', host: 'h', port: 3306 })
-    assert.equal(box.conn('my').database, undefined, 'mysql 不因缺 database 被拦')
+    // mysql 只要 host、port 是**值必填** —— 不指定默认库也能用全限定名查询，
+    // 但 key 仍要落下来（新建要求字段齐全），空串即可
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'my', engine: 'mysql', host: 'h', port: 3306, database: '' }))
+    assert.equal(box.conn('my').database, '', 'mysql 不因 database 是空串被拦')
     // 但 mysql 缺 host / port 仍要报错
     await assert.rejects(
       () => box.tool('sql_connection_set').execute({ name: 'my2', engine: 'mysql' }),
@@ -163,14 +191,14 @@ test('sql_connection_set：必填项按引擎区分（mysql 不要 database，po
 test('sql_connection_set：user / password 不拦 —— 有的库确实不要密码', async () => {
   const box = makeSandbox()
   try {
-    // 不给 user / password 也能写入；是否连得上交给数据库报错
-    await box.tool('sql_connection_set').execute({
-      name: 'nopw', engine: 'postgres', host: 'h', port: 5432, database: 'd',
-    })
+    // 不给 user / password 的**值**也能写入（传空串）；是否连得上交给数据库报错
+    await box.tool('sql_connection_set').execute(
+      connArgs({ name: 'nopw', engine: 'postgres', host: 'h', port: 5432, database: 'd', user: '', password: '' }),
+    )
     const conn = box.conn('nopw')
     assert.ok(conn !== undefined)
-    assert.equal(conn.user, undefined, '不凭空造 user')
-    assert.equal(conn.password, undefined, '不凭空造 password')
+    assert.equal(conn.user, '', '空串原样写入，不凭空造值')
+    assert.equal(conn.password, '', '空串原样写入，不凭空造值')
   } finally { box.cleanup() }
 })
 
@@ -180,9 +208,9 @@ test('sql_connection_set：密码可走 DSH_SQL_PASSWORD_<NAME> 环境变量顶�
   const before = process.env[key]
   try {
     process.env[key] = 'from-env'
-    await box.tool('sql_connection_set').execute({
-      name: 'envpg', engine: 'mysql', host: 'h', port: 3306, user: 'u', database: 'd',
-    })
+    await box.tool('sql_connection_set').execute(
+      connArgs({ name: 'envpg', engine: 'mysql', host: 'h', port: 3306, user: 'u', database: 'd', password: '' }),
+    )
     assert.ok(box.conn('envpg') !== undefined, '环境变量提供了密码就不算缺')
   } finally {
     if (before === undefined) delete process.env[key]
@@ -236,8 +264,61 @@ test('sql_connection_set：sqlite 必须显式给 file，不给就报错', async
       /缺少必填字段.*file/,
       '不再兜底成 :memory:',
     )
-    await box.tool('sql_connection_set').execute({ name: 'b', engine: 'sqlite', file: '/tmp/b.db' })
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'b', file: '/tmp/b.db' }))
     assert.equal(box.conn('b').file, '/tmp/b.db')
+  } finally { box.cleanup() }
+})
+
+test('sql_connection_set：新建时字段 key 全部落进配置（没传的补空串）', async () => {
+  const box = makeSandbox()
+  try {
+    // 只给必填 -> 其余 key 被补出来，值留空，**不报错**
+    await box.tool('sql_connection_set').execute({ name: 'a', engine: 'sqlite', file: '/x.db' })
+    const a = box.conn('a')
+    for (const key of ['engine', 'file', 'env', 'description', 'readOnly']) {
+      assert.ok(Object.hasOwn(a, key), `sqlite 应落下 ${key}`)
+    }
+    assert.equal(a.env, '')
+    assert.equal(a.description, '')
+    assert.equal(a.readOnly, true, 'readOnly 补 true —— 不写就是只读')
+
+    // mysql：user / password / database 也补出来
+    await box.tool('sql_connection_set').execute({ name: 'c', engine: 'mysql', host: 'h', port: 3306 })
+    const c = box.conn('c')
+    for (const key of ['engine', 'host', 'port', 'user', 'password', 'database', 'env', 'description', 'readOnly']) {
+      assert.ok(Object.hasOwn(c, key), `mysql 应落下 ${key}`)
+    }
+    assert.equal(c.user, '')
+    assert.equal(c.database, '')
+
+    // 不适用范围**不补**：sqlite 不该凭空长出 host
+    assert.equal(Object.hasOwn(a, 'host'), false, 'sqlite 不长 host')
+    assert.equal(Object.hasOwn(c, 'file'), false, 'mysql 不长 file')
+
+    // 编辑**不受**影响 —— 「不传=不动」，也不补新 key
+    const raw = box.read()
+    raw.connections.legacy = { engine: 'sqlite', file: ':memory:' }
+    writeFileSync(box.settingsPath, JSON.stringify(raw, null, 2))
+    await box.tool('sql_connection_set').execute(partialArgs({ name: 'legacy', description: '改一下' }))
+    const legacy = box.conn('legacy')
+    assert.equal(legacy.description, '改一下')
+    assert.equal(Object.hasOwn(legacy, 'env'), false, '编辑不补 key')
+  } finally { box.cleanup() }
+})
+
+test('sql_connection_set：port 不会被补空 —— 缺了照旧报必填', async () => {
+  const box = makeSandbox()
+  try {
+    // port 没有"空"可言（0 不是合法端口），补假值只会蒙混过关，所以它仍走必填校验
+    await assert.rejects(
+      () => box.tool('sql_connection_set').execute({ name: 'd', engine: 'mysql', host: 'h' }),
+      /缺少必填字段.*port/,
+    )
+    // host 是值必填 —— 补 key 之后仍然要拦住空值
+    await assert.rejects(
+      () => box.tool('sql_connection_set').execute({ name: 'e', engine: 'mysql', host: '', port: 3306 }),
+      /缺少必填字段.*host/,
+    )
   } finally { box.cleanup() }
 })
 
@@ -254,19 +335,38 @@ test('sql_connection_set：新建必须给 engine', async () => {
   } finally { box.cleanup() }
 })
 
-test('sql_connection_set：换引擎时清掉另一套字段', async () => {
+test('sql_connection_set：engine 不可改（要换引擎只能删掉重建）', async () => {
   const box = makeSandbox()
   try {
-    await box.tool('sql_connection_set').execute(
-      connArgs({ name: 'swap', engine: 'mysql', host: 'h', port: 3306, user: 'u', password: 'p', database: 'app' }),
-    )
-    await box.tool('sql_connection_set').execute({ name: 'swap', engine: 'sqlite', file: '/tmp/s.db' })
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'keep', engine: 'mysql', host: 'h', port: 3306 }))
+    const before = box.read()
 
-    const swap = box.conn('swap')
-    assert.equal(swap.engine, 'sqlite')
-    assert.equal(swap.file, '/tmp/s.db')
-    assert.equal(swap.host, undefined, 'mysql 的 host 应被清掉')
-    assert.equal(swap.password, undefined, 'mysql 的 password 应被清掉')
+    // sqlite <- mysql：拦住
+    await assert.rejects(
+      () => box.tool('sql_connection_set').execute({ name: 'keep', engine: 'sqlite', file: '/tmp/s.db' }),
+      /已是 mysql，不能改成 sqlite.*删掉重建/s,
+    )
+    // postgres <- mysql：同样拦住
+    await assert.rejects(
+      () => box.tool('sql_connection_set').execute({ name: 'keep', engine: 'postgres' }),
+      /已是 mysql，不能改成 postgres/,
+    )
+    assert.deepEqual(box.read(), before, '报错不该改文件')
+
+    // 传**相同**的 engine 不算改 —— 照常编辑
+    await box.tool('sql_connection_set').execute({ name: 'keep', engine: 'mysql', database: 'app' })
+    assert.equal(box.conn('keep').database, 'app')
+    assert.equal(box.conn('keep').engine, 'mysql')
+
+    // 不传 engine 也是「不动」
+    await box.tool('sql_connection_set').execute(partialArgs({ name: 'keep', description: 'x' }))
+    assert.equal(box.conn('keep').engine, 'mysql')
+
+    // 删掉重建：这就是换引擎的正路
+    await box.tool('sql_connection_remove').execute({ name: 'keep' })
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'keep', engine: 'sqlite', file: '/tmp/s.db' }))
+    assert.equal(box.conn('keep').engine, 'sqlite')
+    assert.equal(box.conn('keep').file, '/tmp/s.db')
   } finally { box.cleanup() }
 })
 
@@ -352,13 +452,14 @@ test('数值字段只收真正的 number，不做隐式转换', async () => {
 test('readOnly 只收布尔值 —— 传字符串不能静默变成可写', async () => {
   const box = makeSandbox()
   try {
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'r' }))
+    // 先建一条**只读**连接，好验证非法输入不会把它悄悄改成可写
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'r', readOnly: true }))
     // 旧实现是 value === true，传 'true' 会落盘 readOnly: false（想开只读却得到可写连接）
     await assert.rejects(
       () => box.tool('sql_connection_set').execute({ name: 'r', readOnly: 'true' }),
       /readOnly 必须是布尔值/,
     )
-    assert.notEqual(box.conn('r').readOnly, false, '不能被静默改成 false')
+    assert.equal(box.conn('r').readOnly, true, '不能被静默改成 false')
     // 真正的布尔仍然照常工作
     await box.tool('sql_connection_set').execute({ name: 'r', readOnly: true })
     assert.equal(box.conn('r').readOnly, true)
@@ -383,7 +484,7 @@ test('闭环：工具写入的连接，sql_query 立刻能用（不重启）', a
     await box.tool('sql_connection_set').execute(connArgs({ name: 'live', file: dbFile }))
 
     // 每次调用都重新构建工具，模拟「新一次调用读到新设置」
-    const { tools, adapters } = buildSqlTools(() => loadSettings().resolved)
+    const { tools, adapters } = buildSqlTools(() => loadSettings().settings)
     const exec = tools.find((t) => t.name === 'sql_exec')
     const query = tools.find((t) => t.name === 'sql_query')
 
@@ -402,7 +503,7 @@ test('闭环：sql_connection_remove 后该连接立刻不可用', async () => {
     await box.tool('sql_connection_set').execute(connArgs({ name: 'temp', file: join(box.dir, 'temp.db') }))
     await box.tool('sql_connection_remove').execute({ name: 'temp' })
 
-    const { tools } = buildSqlTools(() => loadSettings().resolved)
+    const { tools } = buildSqlTools(() => loadSettings().settings)
     const query = tools.find((t) => t.name === 'sql_query')
     await assert.rejects(() => query.execute({ sql: 'SELECT 1', connection: 'temp' }), /未找到名为 temp/)
   } finally { box.cleanup() }
@@ -414,14 +515,14 @@ test('闭环：sql_config_set 改的 maxRows 立刻生效', async () => {
     const dbFile = join(box.dir, 'cap.db')
     await box.tool('sql_connection_set').execute(connArgs({ name: 'cap', file: dbFile }))
 
-    const first = buildSqlTools(() => loadSettings().resolved)
+    const first = buildSqlTools(() => loadSettings().settings)
     const exec = first.tools.find((t) => t.name === 'sql_exec')
     await exec.execute({ sql: 'CREATE TABLE t (id INTEGER PRIMARY KEY)', connection: 'cap' })
     await exec.execute({ sql: 'INSERT INTO t (id) VALUES (1),(2),(3)', connection: 'cap' })
 
     await box.tool('sql_config_set').execute({ maxRows: 2 })
 
-    const second = buildSqlTools(() => loadSettings().resolved)
+    const second = buildSqlTools(() => loadSettings().settings)
     const query = second.tools.find((t) => t.name === 'sql_query')
     const result = await query.execute({ sql: 'SELECT * FROM t', connection: 'cap' })
     assert.equal(result.maxRows, 2)
@@ -548,12 +649,19 @@ test('sql_connection_set：env 必须出自 environments', async () => {
   } finally { box.cleanup() }
 })
 
-test('sql_connection_set：env 留空合法（不限定环境）', async () => {
+test('sql_connection_set：env 空串合法（不限定环境）', async () => {
   const box = makeSandbox()
   try {
+    // 新建：传空串 → 原样落盘，文件里看得见"这个连接没限定环境"
     await box.tool('sql_connection_set').execute(connArgs({ name: 'any' }))
-    const any = box.conn('any')
-    assert.equal(any.env, undefined)
+    assert.equal(box.conn('any').env, '')
+
+    // 存量老配置（本来没有 env 字段）编辑时**不补** —— 不把「这次没提」变成静默重置
+    const raw = box.read()
+    raw.connections.legacy = { engine: 'sqlite', file: ':memory:' }
+    writeFileSync(box.settingsPath, JSON.stringify(raw, null, 2))
+    await box.tool('sql_connection_set').execute(partialArgs({ name: 'legacy', file: '/tmp/legacy.db' }))
+    assert.equal(Object.hasOwn(box.conn('legacy'), 'env'), false)
   } finally { box.cleanup() }
 })
 

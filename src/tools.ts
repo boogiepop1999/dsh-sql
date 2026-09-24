@@ -6,7 +6,7 @@
  * @module dsh-sql/tools
  */
 import { createAdapter, type DatabaseAdapter } from './adapters.js'
-import { type ResolvedSqlSettings, type NamedSqlConnection, splitConnectionsByEnv, QUERY_TIMEOUT_MS, EXEC_TIMEOUT_MS, STATS_TIMEOUT_MS } from './config.js'
+import { type SqlSettings, type SqlConnectionConfig, isReadOnly, requireMaxRows, passwordEnvName, splitConnectionsByEnv, QUERY_TIMEOUT_MS, EXEC_TIMEOUT_MS, STATS_TIMEOUT_MS } from './config.js'
 import { countStatements, splitStatements, stripSqlNoise } from './sql-lex.js'
 import {
   asRecord,
@@ -174,6 +174,14 @@ const healthSchema = {
   additionalProperties: true,
 }
 
+/**
+ * 连接定义 + 名字。
+ *
+ * 只在**适配器层**需要 —— 建池子、缓存、报错信息都要用到名字。
+ * 配置层不用它：那里的名字就是连接表的键（见 `ResolvedConnection`）。
+ */
+type NamedSqlConnection = SqlConnectionConfig & { name: string }
+
 /** 适配器缓存项：适配器 + 建它时用的连接定义指纹。 */
 interface CachedAdapter {
   adapter: DatabaseAdapter
@@ -194,7 +202,7 @@ function connectionFingerprint(connection: NamedSqlConnection): string {
 }
 
 /** 构建工具定义；设置**每次调用现读**，adapters 按连接名缓存并按指纹失效。 */
-export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: SqlToolDefinition[]; adapters: ReadonlyMap<string, DatabaseAdapter> } {
+export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDefinition[]; adapters: ReadonlyMap<string, DatabaseAdapter> } {
   /**
    * 适配器缓存：按连接名缓存，但每次比对指纹。
    *
@@ -212,9 +220,21 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
       throw new Error('必须显式指定 connection 参数（不再有默认连接）。可用 sql_settings 查看连接清单。')
     }
     const cfg = loadConfig()
-    const connection = cfg.connections.find((item) => item.name === name)
-    if (connection === undefined) {
+    // 连接表以名字为键，直接取即可 —— 不用再遍历找 .name
+    const stored = cfg.connections?.[name]
+    if (stored === undefined) {
       throw new Error('未找到名为 ' + name + ' 的数据库连接。可用 sql_settings 查看连接清单。')
+    }
+    /**
+     * 密码可走环境变量：**文件里的明文优先，没有才取 `DSH_SQL_PASSWORD_<连接名大写>`**。
+     *
+     * 合流只在**这里**做（用的时候现算），**绝不写回设置文件** —— 读的 settings 就是写的
+     * 那份，一旦在解析层合流，环境变量里的密钥就会被落盘成明文。
+     */
+    const connection: NamedSqlConnection = { name, ...stored }
+    if (connection.password === undefined || connection.password === '') {
+      const fromEnv = process.env[passwordEnvName(name)]?.trim() ?? ''
+      if (fromEnv !== '') connection.password = fromEnv
     }
     return connection
   }
@@ -244,10 +264,10 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
   const pingAllConnections = async (signal?: AbortSignal): Promise<Array<Record<string, unknown>>> => {
     const cfg = loadConfig()
     const { available } = splitConnectionsByEnv(cfg)
-    return await Promise.all(available.map(async (connection) => {
-      const entry: Record<string, unknown> = { name: connection.name }
+    return await Promise.all(Object.entries(available).map(async ([name, connection]) => {
+      const entry: Record<string, unknown> = { name }
       try {
-        await adapterFor(connection).ping(signal)
+        await adapterFor({ name, ...connection }).ping(signal)
         entry.ok = true
         entry.error = ''
       } catch (error) {
@@ -287,7 +307,7 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
     async execute(rawArgs: unknown, exec: unknown) {
       const args = asRecord(rawArgs)
       const sql = assertReadQuery(requiredString(args, 'sql', 'SQL 语句'))
-      const maxRows = loadConfig().maxRows
+      const maxRows = requireMaxRows(loadConfig())
       const { adapter, name } = getAdapter(optionalString(args, 'connection'))
       let result
       try {
@@ -348,7 +368,7 @@ export function buildSqlTools(loadConfig: () => ResolvedSqlSettings): { tools: S
       }
       // 先解析定义并判 readOnly，再建适配器 —— 只读连接不该被建出一个用不上的连接池。
       const connection = resolveConnection(optionalString(args, 'connection'))
-      if (connection.readOnly === true) {
+      if (isReadOnly(connection)) {
         throw new Error('连接 ' + connection.name + ' 的 readOnly=true，sql_exec 已被禁用。需要写操作请把该连接的 readOnly 改为 false（用 sql_connection_set，或直接编辑配置文件）。')
       }
       let changes: number

@@ -29,7 +29,7 @@ export interface SqlPluginContext {
 export function apply(ctx: SqlPluginContext): void {
   loadSettings()
 
-  const { tools, adapters } = buildSqlTools(() => loadSettings().resolved)
+  const { tools, adapters } = buildSqlTools(() => loadSettings().settings)
   const allTools = [...buildSettingsTools(), ...tools]
 
   const disposers: Array<() => void> = []

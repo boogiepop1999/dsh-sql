@@ -3,10 +3,11 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildSqlTools, resolveSettings, assertReadQuery, QUERY_TIMEOUT_MS, EXEC_TIMEOUT_MS } from '../lib/index.js'
+import { buildSqlTools, assertReadQuery, QUERY_TIMEOUT_MS, EXEC_TIMEOUT_MS } from '../lib/index.js'
 
 const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-tools-'))
-const cfg = resolveSettings({ connections: { local: { engine: 'sqlite', file: join(dir, 'app.db') } }, maxRows: 2 })
+// 这些用例要跑写操作，所以显式 readOnly: false —— 不写的话现在默认是只读（fail-safe）
+const cfg = ({ connections: { local: { engine: 'sqlite', file: join(dir, 'app.db'), readOnly: false } }, maxRows: 2 })
 const fixed = (config) => () => config
 const { tools, adapters } = buildSqlTools(fixed(cfg))
 const query = tools.find((t) => t.name === 'sql_query')
@@ -14,7 +15,7 @@ const exec = tools.find((t) => t.name === 'sql_exec')
 const schema = tools.find((t) => t.name === 'sql_schema')
 
 test('工具 timeoutMs 取代码常量，不受设置文件影响', () => {
-  const timed = buildSqlTools(fixed(resolveSettings({
+  const timed = buildSqlTools(fixed(({
     connections: cfg.connections,
     maxRows: 2,
     queryTimeoutMs: 15000,
@@ -80,7 +81,7 @@ test('sql_exec 拒绝多语句，且报错说清收到几条、该怎么办', as
 })
 
 test('sql_exec 在该连接 readOnly=true 时被禁用', async () => {
-  const ro = buildSqlTools(fixed(resolveSettings({ connections: { local: { engine: 'sqlite', file: join(dir, 'app.db'), readOnly: true } } }))).tools
+  const ro = buildSqlTools(fixed(({ connections: { local: { engine: 'sqlite', file: join(dir, 'app.db'), readOnly: true } } }))).tools
   const roExec = ro.find((t) => t.name === 'sql_exec')
   await assert.rejects(
     () => roExec.execute({ sql: 'INSERT INTO items (label) VALUES (\'x\')', connection: 'local' }),
@@ -90,10 +91,10 @@ test('sql_exec 在该连接 readOnly=true 时被禁用', async () => {
 
 test('连接级 readOnly 只影响该连接，其他连接仍可写', async () => {
   const dir2 = mkdtempSync(join(tmpdir(), 'dsh-sql-rw-'))
-  const multi = resolveSettings({
+  const multi = ({
     connections: {
       locked: { engine: 'sqlite', file: join(dir2, 'a.db'), readOnly: true },
-      open: { engine: 'sqlite', file: join(dir2, 'b.db') },
+      open: { engine: 'sqlite', file: join(dir2, 'b.db'), readOnly: false },
     },
   })
   const { tools: multiTools, adapters: multiAdapters } = buildSqlTools(fixed(multi))
