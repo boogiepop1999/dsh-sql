@@ -299,7 +299,7 @@ export function buildSettingsTools(): SqlToolDefinition[] {
       user: { type: 'string', description: '用户名。' },
       password: { type: 'string', description: '密码。' },
       database: { type: 'string', description: '库名。' },
-      readOnly: { type: 'boolean', description: '是否禁用该连接的写操作。**默认 true **。' },
+      readOnly: { type: 'boolean', description: '是否禁用该连接的写操作。默认 true。' },
       env: { type: 'string', description: '所属环境（如 qa / prod）。留空表示不限定环境。' },
       description: { type: 'string', description: '连接说明，最长 ' + DESCRIPTION_MAX_LENGTH + ' 字符。' },
     }),
