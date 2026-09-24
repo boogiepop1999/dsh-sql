@@ -283,7 +283,7 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
     name: 'sql_query',
     description: '执行只读 SQL 查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。一次只能一条语句，会做词法校验拦截写操作。',
     parameters: compileParameters({
-      sql: { type: 'string', required: true, description: '只读 SQL 语句（单条）。' },
+      sql: { type: 'string', required: true },
       connection: { type: 'string', required: true, description: '连接名。用 sql_settings 查看可见连接。' },
       format: { type: 'string', description: '输出格式：table（默认表格）/ csv / json。csv 与 json 会额外返回 formatted 文本，便于落盘或转存。' },
     }),
@@ -347,7 +347,7 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
     name: 'sql_exec',
     description: '执行写操作或 DDL（INSERT / UPDATE / DELETE / CREATE / ALTER / DROP 等）。一次只能一条语句。受该连接的 readOnly 开关保护，返回影响行数。',
     parameters: compileParameters({
-      sql: { type: 'string', required: true, description: '写操作/DDL SQL。' },
+      sql: { type: 'string', required: true },
       connection: { type: 'string', required: true, description: '连接名。用 sql_settings 查看可见连接。' },
     }),
     output: {
@@ -389,7 +389,7 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
     name: 'sql_schema',
     description: '查看数据库结构：返回表清单，或指定 table 时返回该表的列信息（名称/类型/非空/主键）。',
     parameters: compileParameters({
-      table: { type: 'string', description: '表名（可选；缺省列出全部表）。' },
+      table: { type: 'string' },
       connection: { type: 'string', required: true, description: '连接名。用 sql_settings 查看可见连接。' },
     }),
     output: {
