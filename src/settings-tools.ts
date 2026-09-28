@@ -111,6 +111,12 @@ export function buildSettingsTools(): SqlToolDefinition[] {
       const head = activeEnv !== '' ? '当前环境 ' + activeEnv : '当前环境' + EMPTY
       lines.push('# dsh-sql — ' + head + '，' + String(Object.keys(inScope).length) + ' 个可见连接')
       lines.push('')
+      // 环境单列一节、一行列出（跟 api-call 一致）：这一节只回答"有哪些环境、当前是哪个"，
+      // 拿来做表格反而只剩一列，不如一行文字好读。
+      lines.push('## 环境', environments.length > 0
+        ? environments.map((name) => (name === activeEnv ? '**' + cell(name) + '** ← 当前' : cell(name))).join(' ｜ ')
+        : EMPTY)
+      lines.push('')
       lines.push('## 可见连接' + (activeEnv !== '' ? '（当前环境 ' + activeEnv + '）' : '（不限环境）'))
       lines.push('| 连接名 | 引擎 | 环境 | 只读 | 描述 |')
       lines.push('| --- | --- | --- | --- | --- |')
@@ -118,10 +124,13 @@ export function buildSettingsTools(): SqlToolDefinition[] {
         // readOnly 值非法时表格里**只显示生效结果**（已按 fail-safe 算成只读）；
         // "值写错了"这件事本身是问题，放「⚠ 问题」节去说 —— 表格只陈述现状。
         const readOnlyCell = isReadOnly(connection) ? '🔒 是' : '否'
+        // env 用 `||` 而不是 `??`：空串（以及只有空白）都算"不限环境"，与切分逻辑同一套规则。
+        // 用 `??` 只兜 undefined/null，空串会渲染成一个空格子，看着像"漏填"。
+        const envCell = typeof connection.env === 'string' ? connection.env.trim() : ''
         lines.push(
           '| ' + cell(name) +
           ' | ' + cell(connection.engine) +
-          ' | ' + cell(connection.env ?? '不限环境') +
+          ' | ' + cell(envCell || '不限环境') +
           ' | ' + readOnlyCell +
           ' | ' + cell(connection.description ?? '') + ' |',
         )
@@ -143,18 +152,45 @@ export function buildSettingsTools(): SqlToolDefinition[] {
       }
 
       lines.push('')
+      // 当前环境与环境清单**不在这里重复**：上面「## 环境」一节已经说清了，
+      // 全局设置这节只放"设置项"本身。
       lines.push('## 全局设置')
       lines.push('| 项 | 值 |')
       lines.push('| --- | --- |')
-      lines.push('| 当前环境 | ' + (activeEnv !== '' ? cell(activeEnv) : EMPTY) + ' |')
-      lines.push('| 环境清单 | ' + (environments.length > 0 ? environments.map(cell).join('、') : EMPTY) + ' |')
       lines.push('| 行数上限 | ' + (maxRowsValue !== undefined ? cell(String(maxRowsValue)) : EMPTY) + ' |')
       lines.push('| 配置文件 | `' + cell(loaded.file) + '` |')
 
+      // 问题集中放最后，逐项列出「缺什么 + 该调哪个工具」。
+      //
+      // ⚠ 这里只放**值不对**（没配、配错、指向了不存在的环境）。**格式坏了**
+      // （文件不是合法 JSON）在前面就抛异常了，走不到这里。
+      //
+      // 写入侧（sql_config_set / sql_connection_set）是唯一把关点 —— 正常情况下
+      // 写不进"指向不存在环境"的值。但手改配置文件能绕过它，所以读取侧也要看得见：
+      // 否则表现只是"某个连接凭空消失 / 当前环境名不对"，没人想得到是环境清单变了。
       const problems: string[] = []
+      const envList = environments.length > 0 ? environments.join(', ') : EMPTY
       if (environments.length === 0) problems.push('environments 为空，请先用 sql_config_set 配置环境清单。')
-      if (activeEnv === '') problems.push('activeEnv 未设置，请先用 sql_config_set 指定当前环境。')
+      if (activeEnv === '') {
+        problems.push('activeEnv 未设置，请先用 sql_config_set 指定当前环境（可选: ' + envList + '）。')
+      } else if (!environments.includes(activeEnv)) {
+        // 环境清单被改过（删掉了当前环境），而 activeEnv 还指着它
+        problems.push(
+          'activeEnv "' + activeEnv + '" 不在环境清单里（可选: ' + envList +
+          '）：请用 sql_config_set 改成清单里的环境，或把它加回 environments。',
+        )
+      }
       if (Object.keys(allConnections).length === 0) problems.push('还没有任何连接，请先用 sql_connection_set 添加。')
+      // 连接的 env 指向清单外的环境：它在**任何**环境下都不会出现（既不是"不限环境"，
+      // 也匹配不上 activeEnv），所以必须说出来 —— 否则这条连接就像凭空消失了。
+      for (const [name, connection] of Object.entries(allConnections)) {
+        const env = typeof connection?.env === 'string' ? connection.env.trim() : ''
+        if (env === '' || environments.includes(env)) continue
+        problems.push(
+          '连接 "' + name + '" 的 env "' + env + '" 不在环境清单里（可选: ' + envList +
+          '）：它在任何环境下都不会出现。请用 sql_connection_set 改掉，或把它加回 environments。',
+        )
+      }
       // maxRows 非法：使用处（sql_query）会直接报错，这里先提一句，免得"查询全挂"来得突然
       if (maxRowsError !== undefined) problems.push(maxRowsError)
       // readOnly 值非法：生效值已按只读算（fail-safe），但必须说出来 ——
@@ -185,7 +221,7 @@ export function buildSettingsTools(): SqlToolDefinition[] {
       CONFIG_WRITE_WARNING,
     parameters: compileParameters({
       activeEnv: { type: 'string', description: '当前环境名。传空串表示不设置环境。' },
-      environments: { type: 'array', description: '环境清单（字符串数组），传空数组会连带清空 activeEnv。' },
+      environments: { type: 'array', description: '环境清单（字符串数组）' },
       maxRows: { type: 'number', description: '查询返回行数上限（1-10000）。' },
     }),
     output: textOutput,
@@ -229,20 +265,26 @@ export function buildSettingsTools(): SqlToolDefinition[] {
       const beforeEnvironments = Array.isArray(before.environments) ? before.environments : []
       const effectiveEnvironments = nextEnvironments ?? beforeEnvironments
 
-      // environments 清空是强语义：顺带把 activeEnv 也清掉，避免「清单为空但当前环境还在」的矛盾状态。
-      const clearedEnvironments = nextEnvironments !== undefined && nextEnvironments.length === 0
-
-      // 双向校验：改完 activeEnv 必须落在 environments 里。传空 = 清空，不校验。
-      const nextActiveEnv = clearedEnvironments
-        ? ''
-        : args.activeEnv !== undefined
-          ? String(args.activeEnv).trim()
-          : (typeof before.activeEnv === 'string' ? before.activeEnv : '')
+      // **不再"清空 environments 就顺手清掉 activeEnv"**。
+      //
+      // 那个隐式副作用是自作主张：清空清单的意图只是"不要这些环境了"，未必包含
+      // "顺便把我的当前环境也抹掉"。而且它把状态改得看不见 —— 用户只看到一句
+      // "已一并清空"，却不知道 activeEnv 原本是什么、要不要恢复。
+      //
+      // 现在全走**同一套单向校验**：改完之后 activeEnv 必须落在最终的 environments 里。
+      // 想清空清单就先把 activeEnv 置空（或一并改成一个仍在清单里的环境）——
+      // 不做"清单为空就特批"那种例外，那种例外本身就是第二套逻辑。
+      //
+      // 读取侧另有一道检查，负责"手改配置文件绕过写入侧"的情况。
+      const nextActiveEnv = args.activeEnv !== undefined
+        ? String(args.activeEnv).trim()
+        : (typeof before.activeEnv === 'string' ? before.activeEnv : '')
       if (nextActiveEnv !== '' && !effectiveEnvironments.includes(nextActiveEnv)) {
-        const available = effectiveEnvironments.length > 0 ? effectiveEnvironments.join('、') : '（空）'
+        const available = effectiveEnvironments.length > 0 ? effectiveEnvironments.join(', ') : '（空）'
         throw new Error(
-          'activeEnv "' + nextActiveEnv + '" 不在 environments 里（可选：' + available + '）。' +
-          '请一并修改 environments，或改成一个已存在的环境。',
+          'activeEnv "' + nextActiveEnv + '" 不在 environments 里（可选: ' + available + '）。' +
+          '请一并修改 environments，或改成一个已存在的环境。' +
+          '（想在清空清单的同时去掉当前环境，就在同一次调用里把 activeEnv 传空串。）',
         )
       }
 
@@ -251,19 +293,21 @@ export function buildSettingsTools(): SqlToolDefinition[] {
           if (args[key] !== undefined) (draft as Record<string, unknown>)[key] = Number(args[key])
         }
         if (nextEnvironments !== undefined) draft.environments = nextEnvironments
-        if (args.activeEnv !== undefined || clearedEnvironments) draft.activeEnv = nextActiveEnv
+        if (args.activeEnv !== undefined) draft.activeEnv = nextActiveEnv
         return draft
       })
       const changed: string[] = []
-      if (args.activeEnv !== undefined && !clearedEnvironments) changed.push('activeEnv=' + String(settings.activeEnv ?? ''))
+      if (args.activeEnv !== undefined) changed.push('activeEnv=' + String(settings.activeEnv ?? ''))
       if (nextEnvironments !== undefined) changed.push('environments=' + (nextEnvironments.length > 0 ? nextEnvironments.join('、') : '（空）'))
       for (const key of keys) {
         if (args[key] !== undefined) changed.push(key + '=' + String((settings as Record<string, unknown>)[key]))
       }
 
       const lines = ['已更新设置：' + changed.join('，')]
-      if (clearedEnvironments && before.activeEnv !== undefined && before.activeEnv !== '') {
-        lines.push('⚠ activeEnv 一并清空（原 ' + String(before.activeEnv) + '），现在只列不限定环境的连接。')
+      // 清单被清空后 activeEnv 可能还留着（不再自动清）—— 说清楚它现在是什么状态，
+      // 别让用户以为"清空清单"顺便把当前环境也处理了。
+      if (nextEnvironments !== undefined && nextEnvironments.length === 0 && nextActiveEnv !== '') {
+        lines.push('⚠ activeEnv 仍是 "' + nextActiveEnv + '"，但它已不在环境清单里 —— 这一点会在 sql_settings 的「问题」节里指出。')
       }
       // 删掉某个环境时，提示还有哪些连接的 env 指向它（不阻断 —— 只是那些连接从此匹配不上任何环境）。
       if (nextEnvironments !== undefined) {
@@ -396,9 +440,9 @@ export function buildSettingsTools(): SqlToolDefinition[] {
       if (entry.env !== undefined && entry.env !== '') {
         const known = Array.isArray(settings.environments) ? settings.environments : []
         if (!known.includes(entry.env)) {
-          const available = known.length > 0 ? known.join('、') : '（空）'
+          const available = known.length > 0 ? known.join(', ') : '（空）'
           throw new Error(
-            'env "' + entry.env + '" 不在 environments 里（可选：' + available + '）。' +
+            'env "' + entry.env + '" 不在 environments 里（可选: ' + available + '）。' +
             '可以用 sql_config_set 把它加进 environments，或留空表示不限定环境。',
           )
         }
@@ -431,7 +475,7 @@ export function buildSettingsTools(): SqlToolDefinition[] {
       const table = isConnectionTable(settings.connections) ? settings.connections : {}
       if (!Object.hasOwn(table, name)) {
         const known = Object.keys(table)
-        throw new Error('连接 "' + name + '" 不存在，可用：' + (known.length > 0 ? known.join('、') : '（空，用 sql_connection_set 添加）'))
+        throw new Error('连接 "' + name + '" 不存在，可选: ' + (known.length > 0 ? known.join(', ') : '（空，用 sql_connection_set 添加）'))
       }
       mutate((draft) => {
         const target = isConnectionTable(draft.connections) ? draft.connections : {}

@@ -122,9 +122,29 @@ test('sql_settings：值不对（不是格式坏）时照常渲染，只在问�
     assert.match(value.report, /^# dsh-sql/, '仍然给出报告')
     assert.match(value.report, /## ⚠ 问题/, '问题集中放在末尾')
     assert.match(value.report, /activeEnv 未设置.*sql_config_set/)
-    // 表格里的空值统一成（空），不再是"未设置"这类各有说法的词
-    assert.match(value.report, /\| 当前环境 \| （空） \|/)
-    assert.match(value.report, /\| 环境清单 \| （空） \|/)
+    // 环境单列一节；当前环境与环境清单**不再**在「全局设置」里重复（跟 api-call 一致）
+    assert.match(value.report, /## 环境\n（空）/, '环境为空时这一节直接写（空）')
+    assert.doesNotMatch(value.report, /\| 当前环境 \|/)
+    assert.doesNotMatch(value.report, /\| 环境清单 \|/)
+  } finally { box.cleanup() }
+})
+
+test('sql_settings：连接表的环境列，空 env 显示「不限环境」（不是空格子）', async () => {
+  // env 为空串/只有空白都算"不限环境"（切分逻辑就是这么判的），表格必须跟它一致。
+  // 从前这里用 `??` 兜底，只认 undefined/null，空串会渲染成一个空格子 —— 看着像漏填。
+  const box = makeSandbox()
+  try {
+    await box.tool('sql_config_set').execute({ environments: ['qa'] })
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'no-env' }))
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'blank-env', env: '   ' }))
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'in-qa', env: 'qa' }))
+    await box.tool('sql_config_set').execute({ activeEnv: 'qa' })
+
+    const value = await box.tool('sql_settings').execute({})
+    assert.match(value.report, /\| no-env \| sqlite \| 不限环境 \|/, '没写 env')
+    assert.match(value.report, /\| blank-env \| sqlite \| 不限环境 \|/, '只有空白也算不限环境')
+    assert.match(value.report, /\| in-qa \| sqlite \| qa \|/, '有 env 就直接写环境名')
+    assert.doesNotMatch(value.report, /\|  {2,}\|/, '不该再有空格子')
   } finally { box.cleanup() }
 })
 
@@ -600,7 +620,7 @@ test('sql_config_set：activeEnv 必须在 environments 里', async () => {
     await box.tool('sql_config_set').execute({ environments: ['qa', 'prod'] })
     await assert.rejects(
       () => box.tool('sql_config_set').execute({ activeEnv: 'uat' }),
-      /activeEnv "uat" 不在 environments 里（可选：qa、prod）/,
+      /activeEnv "uat" 不在 environments 里（可选: qa, prod）/,
     )
     const ok = await box.tool('sql_config_set').execute({ activeEnv: 'qa' })
     assert.match(ok.report, /activeEnv=qa/)
@@ -628,15 +648,26 @@ test('sql_config_set：反向校验 —— 改 environments 不能把当前 acti
   } finally { box.cleanup() }
 })
 
-test('sql_config_set：environments 传空数组会连带清空 activeEnv', async () => {
+test('sql_config_set：清空 environments 不再连带清掉 activeEnv，而是要求同一次调用里一起处理', async () => {
+  // 从前这里会"连带清空 activeEnv" —— 那是个自作主张的隐式副作用：清空清单的意图
+  // 只是"不要这些环境了"，未必包含"顺便把我的当前环境也抹掉"。
+  // 现在全走同一套单向校验：activeEnv 必须落在最终的 environments 里。
   const box = makeSandbox()
   try {
     await box.tool('sql_config_set').execute({ environments: ['qa', 'prod'] })
     await box.tool('sql_config_set').execute({ activeEnv: 'qa' })
 
-    const out = await box.tool('sql_config_set').execute({ environments: [] })
+    // 只清清单、不管 activeEnv → 拦下，并告诉怎么办
+    await assert.rejects(
+      () => box.tool('sql_config_set').execute({ environments: [] }),
+      /activeEnv "qa" 不在 environments 里.*把 activeEnv 传空串/s,
+    )
+    assert.deepEqual(box.read().environments, ['qa', 'prod'], '被拒的写入不能留痕')
+    assert.equal(box.read().activeEnv, 'qa')
+
+    // 同一次调用里把 activeEnv 一并传空 → 放行
+    const out = await box.tool('sql_config_set').execute({ environments: [], activeEnv: '' })
     assert.match(out.report, /environments=（空）/)
-    assert.match(out.report, /activeEnv 一并清空（原 qa）/)
     assert.deepEqual(box.read().environments, [])
     assert.equal(box.read().activeEnv, '')
   } finally { box.cleanup() }
@@ -660,7 +691,7 @@ test('sql_connection_set：env 必须出自 environments', async () => {
     const before = box.read()
     await assert.rejects(
       () => box.tool('sql_connection_set').execute(connArgs({ name: 'x', env: 'qa' })),
-      /env "qa" 不在 environments 里（可选：（空））/,
+      /env "qa" 不在 environments 里（可选: （空））/,
     )
     assert.deepEqual(box.read(), before, '报错不该改文件')
 
@@ -755,13 +786,56 @@ test('sql_settings：activeEnv 设了环境时，当前环境的 + default 的�
   } finally { box.cleanup() }
 })
 
+test('sql_settings：环境清单被改小后，落到范围外的 activeEnv / 连接 env 都在问题节报出来', async () => {
+  // 写入侧拦得住正常路径，但**手改配置文件**能绕过它 —— 读取侧必须看得见，
+  // 否则表现只是"当前环境名不对 / 某个连接凭空消失"，没人想得到是环境清单变了。
+  const box = makeSandbox()
+  try {
+    await box.tool('sql_config_set').execute({ environments: ['qa', 'prod'] })
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'prod-db', env: 'prod' }))
+    await box.tool('sql_config_set').execute({ activeEnv: 'prod' })
+
+    // 手工把 prod 从清单里删掉（绕过写入侧校验）
+    const raw = box.read()
+    raw.environments = ['qa']
+    writeFileSync(box.settingsPath, JSON.stringify(raw, null, 2), 'utf8')
+
+    const value = await box.tool('sql_settings').execute({})
+    assert.match(value.report, /activeEnv "prod" 不在环境清单里/, '当前环境指向了不存在的环境')
+    assert.match(value.report, /连接 "prod-db" 的 env "prod" 不在环境清单里/, '连接的 env 也指向了不存在的环境')
+    assert.match(value.report, /它在任何环境下都不会出现/, '要说清后果，否则看不出严重性')
+    // 两条都要带指路（该用哪个工具改）
+    assert.match(value.report, /sql_config_set/)
+    assert.match(value.report, /sql_connection_set/)
+  } finally { box.cleanup() }
+})
+
+test('sql_connection_set：env 必须在环境清单里（空串除外）', async () => {
+  const box = makeSandbox()
+  try {
+    await box.tool('sql_config_set').execute({ environments: ['qa', 'prod'] })
+    // 清单外的名字当场拦下，并给出可选值
+    await assert.rejects(
+      () => box.tool('sql_connection_set').execute(connArgs({ name: 'x', env: 'ghost' })),
+      /env "ghost" 不在 environments 里（可选: qa, prod）/,
+    )
+    // 空串 = 不限环境，不校验
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'free', env: '' }))
+    assert.equal(box.conn('free').env, '', '空串允许（不限环境）')
+    // 清单里的名字正常写入
+    await box.tool('sql_connection_set').execute(connArgs({ name: 'in-qa', env: 'qa' }))
+    assert.equal(box.conn('in-qa').env, 'qa')
+  } finally { box.cleanup() }
+})
+
 test('sql_settings：环境未配置时给出软提示，且不引导手动编辑', async () => {
   const box = makeSandbox()
   try {
     const value = await box.tool('sql_settings').execute({})
     assert.match(value.report, /## ⚠ 问题/)
     assert.match(value.report, /environments 为空，请先用 sql_config_set 配置环境清单。/)
-    assert.match(value.report, /activeEnv 未设置，请先用 sql_config_set 指定当前环境。/)
+    // 提示带上可选值（现在清单为空，所以是（空））—— 跟 api-call 一致
+    assert.match(value.report, /activeEnv 未设置，请先用 sql_config_set 指定当前环境（可选: （空））。/)
     assert.doesNotMatch(value.report, /手动|编辑文件|settings\.json 里填/)
   } finally { box.cleanup() }
 })

@@ -214,15 +214,19 @@ export function splitConnectionsByEnv(settings: SqlSettings): {
   excluded: Record<string, SqlConnectionConfig>
 } {
   const activeEnv = typeof settings.activeEnv === 'string' ? settings.activeEnv.trim() : ''
+  const envNames = Array.isArray(settings.environments) ? settings.environments : []
   const available: Record<string, SqlConnectionConfig> = {}
   const excluded: Record<string, SqlConnectionConfig> = {}
   for (const [name, connection] of Object.entries(settings.connections ?? {})) {
     // `env` 空白（或没写）都算"不限环境"：空白串不是合法环境名，当成"属于名字是空白的
     // 环境"会让这条连接在**任何**环境下都匹配不上，凭空消失。
     const env = typeof connection?.env === 'string' ? connection.env.trim() : ''
-    if (env === '') available[name] = connection
-    else if (env === activeEnv) available[name] = connection
-    else excluded[name] = connection
+    if (env === '') { available[name] = connection; continue }
+    if (env === activeEnv) { available[name] = connection; continue }
+    // `env` 指向一个**不存在的环境**：既不是"不限环境"，也不属于任何现存环境，
+    // 所以 two 组都不进 —— 它会出现在「其它环境」那份索引里的话，看着像"还能用"，
+    // 实际在任何环境下都不会出现。这种情况由 sql_settings 的「⚠ 问题」节点名。
+    if (envNames.includes(env)) excluded[name] = connection
   }
   return { available, excluded }
 }

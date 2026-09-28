@@ -208,8 +208,10 @@ test('splitConnectionsByEnv：activeEnv 为空时只有不限环境的可用', (
 })
 
 test('splitConnectionsByEnv：环境名区分大小写；activeEnv 会 trim', () => {
+  const environments = ['qa']
   const upper = splitConnectionsByEnv({
     activeEnv: 'QA',
+    environments,
     connections: { 'qa-db': { engine: 'sqlite', env: 'qa' } },
   })
   assert.deepEqual(Object.keys(upper.available), [], 'QA ≠ qa')
@@ -217,9 +219,27 @@ test('splitConnectionsByEnv：环境名区分大小写；activeEnv 会 trim', ()
 
   const padded = splitConnectionsByEnv({
     activeEnv: '  qa  ',
+    environments,
     connections: { 'qa-db': { engine: 'sqlite', env: 'qa' } },
   })
   assert.deepEqual(Object.keys(padded.available), ['qa-db'], 'activeEnv 两侧空白应被忽略')
+})
+
+test('splitConnectionsByEnv：env 指向不存在的环境时，两组都不进', () => {
+  // 它既不是"不限环境"，也不属于任何现存环境 —— 混进「其它环境」那份索引会让人
+  // 以为"还能用"，实际在任何环境下都不会出现。这种情况交给 sql_settings 的问题节点名。
+  const { available, excluded } = splitConnectionsByEnv({
+    activeEnv: 'qa',
+    environments: ['qa', 'prod'],
+    connections: {
+      'in-qa': { engine: 'sqlite', env: 'qa' },
+      'in-prod': { engine: 'sqlite', env: 'prod' },
+      free: { engine: 'sqlite', env: '' },
+      ghost: { engine: 'sqlite', env: 'nope' },
+    },
+  })
+  assert.deepEqual(Object.keys(available).sort(), ['free', 'in-qa'])
+  assert.deepEqual(Object.keys(excluded), ['in-prod'], '只有"有效的其它环境"才进索引')
 })
 
 test('splitConnectionsByEnv：connections 缺失时返回两个空表，不崩', () => {
