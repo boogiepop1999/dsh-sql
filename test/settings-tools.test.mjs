@@ -74,7 +74,7 @@ test('sql_settings：空配置正常渲染 + 三条告警', async () => {
   const box = makeSandbox()
   try {
     const value = await box.tool('sql_settings').execute({})
-    assert.match(value.report, /# dsh-sql — 当前环境（未设置），0 个可见连接/)
+    assert.match(value.report, /# dsh-sql — 当前环境（空），0 个可见连接/)
     assert.match(value.report, /environments 为空/)
     assert.match(value.report, /activeEnv 未设置/)
     assert.match(value.report, /还没有任何连接/)
@@ -95,14 +95,36 @@ test('sql_settings：只读与描述出现在报告里', async () => {
   } finally { box.cleanup() }
 })
 
-test('sql_settings：设置文件坏掉时不崩，把问题摊开', async () => {
+test('sql_settings：设置文件格式坏掉时直接报错，并带上文件路径', async () => {
+  // 「格式坏了」与「值不对」是两回事：前者是技术故障、数据不可信，继续渲染一份
+  // 半真半假的报告只会让人照着它做判断。所以直接抛，并把**文件路径**带出去让用户自己修。
   const box = makeSandbox()
   try {
     writeFileSync(box.settingsPath, '{ 坏掉的 JSON', 'utf8')
+    await assert.rejects(
+      () => box.tool('sql_settings').execute({}),
+      /不是合法 JSON/,
+      '格式坏了应当直接抛错',
+    )
+    await assert.rejects(
+      () => box.tool('sql_settings').execute({}),
+      new RegExp(box.settingsPath.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')),
+      '报错里要带文件路径，否则用户不知道去修哪个文件',
+    )
+  } finally { box.cleanup() }
+})
+
+test('sql_settings：值不对（不是格式坏）时照常渲染，只在问题节里指路', async () => {
+  // 与上一条对照：新装时配置全空是**正常的中间状态**，不该变成一片报错。
+  const box = makeSandbox()
+  try {
     const value = await box.tool('sql_settings').execute({})
-    assert.match(value.report, /设置不可用/)
-    assert.match(value.report, /不是合法 JSON/)
-    assert.match(value.report, /配置文件/)
+    assert.match(value.report, /^# dsh-sql/, '仍然给出报告')
+    assert.match(value.report, /## ⚠ 问题/, '问题集中放在末尾')
+    assert.match(value.report, /activeEnv 未设置.*sql_config_set/)
+    // 表格里的空值统一成（空），不再是"未设置"这类各有说法的词
+    assert.match(value.report, /\| 当前环境 \| （空） \|/)
+    assert.match(value.report, /\| 环境清单 \| （空） \|/)
   } finally { box.cleanup() }
 })
 
@@ -707,7 +729,7 @@ test('sql_settings：activeEnv 为空时只列不限环境的，带环境的进�
     await box.tool('sql_connection_set').execute(connArgs({ name: 'scratch' }))
 
     const value = await box.tool('sql_settings').execute({})
-    assert.match(value.report, /当前环境（未设置），1 个可见连接/)
+    assert.match(value.report, /当前环境（空），1 个可见连接/)
     assert.match(value.report, /## 可见连接（不限环境）/)
     assert.match(value.report, /scratch/)
     assert.match(value.report, /其它环境的连接：qa-only、prod-only/)
