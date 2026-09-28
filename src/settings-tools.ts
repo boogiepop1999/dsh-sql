@@ -72,7 +72,7 @@ export function buildSettingsTools(): SqlToolDefinition[] {
     name: 'sql_settings',
     description:
       '总览：连接名清单 + 全局设置。\n' +
-      '报告已是 Markdown，直接粘进正文（别包代码块、别转义）。配置文件改动立即生效，不用重启。',
+      '报告已是 Markdown，直接粘进正文渲染。配置文件改动立即生效，不用重启。',
     parameters: compileParameters({}),
     output: {
       schema: {
@@ -422,7 +422,7 @@ export function buildSettingsTools(): SqlToolDefinition[] {
   const sqlConnectionRemove: SqlToolDefinition = {
     name: 'sql_connection_remove',
     description:
-      '删除一个连接（只改配置；已建的连接池留到进程退出，不影响使用）。\n' + CONFIG_WRITE_WARNING,
+      '删除一个连接，连接池在 DSH 关闭时清除。\n' + CONFIG_WRITE_WARNING,
     parameters: compileParameters({
       name: { type: 'string', required: true, description: '连接名。' },
     }),
