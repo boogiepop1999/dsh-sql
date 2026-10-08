@@ -3,5 +3,6 @@ node_modules/
 .DS_Store
 .idea/
 
-
+# 不锁版本：依赖只有三个（schemastery / mysql2 / pg），都是稳定的老包，
+# 且 schemastery 的版本实际由宿主决定 —— 锁在本机没意义。
 pnpm-lock.yaml
