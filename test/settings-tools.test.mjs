@@ -1,63 +1,61 @@
-// 配置管理四件套：sql_settings / sql_config_set / sql_connection_set / sql_connection_remove
+// 配置报告工具：sql_settings。
+//
+// 配置**编辑**已经搬到插件设置页（见 config-schema.ts），所以这里只剩只读报告 ——
+// 它的「⚠ 问题」节是发现配置错误的主要渠道：设置页只保证形状（schema），
+// "activeEnv 得命中某个环境的名字"这类跨字段规则只能在运行时判。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { buildSettingsTools, buildSqlTools, SETTINGS_DIR_ENV, SETTINGS_FILE_NAME, loadSettings, settingsFile } from '../lib/index.js'
+import { buildSettingsTools } from '../lib/index.js'
 
-/** 每个用例独立临时目录，绝不碰真实 $DSH_HOME/sql。 */
-function makeSandbox() {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-cfg-'))
-  process.env[SETTINGS_DIR_ENV] = dir
-  const tools = buildSettingsTools()
-  const byName = (name) => tools.find((t) => t.name === name)
+/**
+ * 造一个"配置沙盒"。
+ *
+ * 配置现在是**宿主注入的对象**（`apply(ctx, config)`），不再走文件 —— 所以测试里
+ * 也只是一份普通对象：`write()` 改它、`tool()` 拿到工具、`read()` 读回来。
+ * 不碰文件系统，也就没有临时目录、环境变量、清理那一套。
+ */
+function makeSandbox(initial = {}) {
+  let config = { activeEnv: '', maxRows: 1000, environments: {}, connections: {}, ...initial }
+  const tools = buildSettingsTools(() => config)
   return {
-    dir,
-    settingsPath: join(dir, SETTINGS_FILE_NAME),
-    read: () => JSON.parse(readFileSync(join(dir, SETTINGS_FILE_NAME), 'utf8')),
-    /** 按名字取已落盘的连接定义（connections 是字典，键即名字）。 */
-    conn: (name) => JSON.parse(readFileSync(join(dir, SETTINGS_FILE_NAME), 'utf8')).connections?.[name],
-    tool: byName,
-    cleanup() { delete process.env[SETTINGS_DIR_ENV]; rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) },
+    tool: (name) => tools.find((t) => t.name === name),
+    /** 换一份配置（模拟宿主文档变了 —— 报告每次现取，所以下一步就生效）。 */
+    write: (value) => { config = value },
+    /** 读回当前配置（断言用）。 */
+    read: () => config,
   }
 }
 
 /**
- * 建一个连接的**完整**参数（新建用）。
+ * 造一份环境字典（新形状：「随机 id → { name }」）。
  *
- * 新建时每个适用字段的 key 都必须给出来（值可以是空串，但不能不传），
- * 所以这里按引擎铺上全部 key，调用方用 overrides 覆盖成想要的取值。
- *
- * 编辑场景**不要**用这个 —— 那里是「不传=不动」，用 partialArgs 更能表达意图。
+ * 测试里按名字给（`envs('qa','uat')`）比手写随机 id 清楚；id 用一个可预测的短串，
+ * 方便出问题时对着看。
  */
-function connArgs(overrides = {}) {
-  const engine = overrides.engine ?? 'sqlite'
-  const base = engine === 'sqlite'
-    ? { name: 'x', engine: 'sqlite', file: ':memory:', env: '', description: '', readOnly: false }
-    : {
-        name: 'x',
-        engine,
-        host: 'h',
-        port: engine === 'postgres' ? 5432 : 3306,
-        user: '',
-        password: '',
-        database: '',
-        env: '',
-        description: '',
-        readOnly: false,
-      }
-  return { ...base, ...overrides }
+function envs(...names) {
+  return Object.fromEntries(names.map((name, i) => ['e' + (i + 1), { name }]))
 }
 
-/** 编辑用的**部分**参数：只给要改的字段（新建不许这么传）。 */
-function partialArgs(overrides = {}) {
-  return { name: 'x', ...overrides }
+/**
+ * 造一个连接定义。字段给全（跟出厂样子一致），要改哪项就覆盖哪项。
+ *
+ * 连接在报告里只被**读**（表格那几列），所以这里不需要默认值 —— 报告不校验，
+ * 缺字段就是显示成空。要造"值非法"的场景（readOnly 写了字符串）显式覆盖即可。
+ */
+function conn(overrides = {}) {
+  return {
+    engine: 'sqlite',
+    file: ':memory:',
+    env: '',
+    description: '',
+    readOnly: false,
+    ...overrides,
+  }
 }
 
-test('四个工具都注册且名字正确', () => {
+test('只注册 sql_settings 一个工具（配置编辑已搬到设置页）', () => {
   const names = buildSettingsTools().map((t) => t.name).sort()
-  assert.deepEqual(names, ['sql_config_set', 'sql_connection_remove', 'sql_connection_set', 'sql_settings'])
+  assert.deepEqual(names, ['sql_settings'])
 })
 
 test('每个工具的 schema 是 object JSON Schema', () => {
@@ -72,770 +70,163 @@ test('每个工具的 schema 是 object JSON Schema', () => {
 
 test('sql_settings：空配置正常渲染 + 三条告警', async () => {
   const box = makeSandbox()
-  try {
-    const value = await box.tool('sql_settings').execute({})
-    assert.match(value.report, /# dsh-sql — 当前环境（空），0 个可见连接/)
-    assert.match(value.report, /environments 为空/)
-    assert.match(value.report, /activeEnv 未设置/)
-    assert.match(value.report, /还没有任何连接/)
-    const blocks = box.tool('sql_settings').output.render({}, value)
-    assert.equal(blocks[0].type, 'text')
-    assert.match(blocks[0].text, /## 全局设置/)
-    assert.deepEqual(box.read().connections, {}, '出厂不带任何连接')
-  } finally { box.cleanup() }
+  const value = await box.tool('sql_settings').execute({})
+  assert.match(value.report, /# dsh-sql — 当前环境（空），0 个可见连接/)
+  assert.match(value.report, /environments 为空/)
+  assert.match(value.report, /activeEnv 未设置/)
+  assert.match(value.report, /还没有任何连接/)
+  const blocks = box.tool('sql_settings').output.render({}, value)
+  assert.equal(blocks[0].type, 'text')
+  assert.match(blocks[0].text, /## 全局设置/)
+  assert.deepEqual(box.read().connections, {}, '出厂不带任何连接')
 })
 
 test('sql_settings：只读与描述出现在报告里', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'prod', file: '/tmp/p.db', readOnly: true, description: '生产库，慎写' }))
-    const value = await box.tool('sql_settings').execute({})
-    assert.match(value.report, /🔒 是/)
-    assert.match(value.report, /生产库，慎写/)
-  } finally { box.cleanup() }
+  const box = makeSandbox({
+    connections: { prod: conn({ file: '/tmp/p.db', readOnly: true, description: '生产库，慎写' }) },
+  })
+  const value = await box.tool('sql_settings').execute({})
+  assert.match(value.report, /🔒 是/)
+  assert.match(value.report, /生产库，慎写/)
 })
 
-test('sql_settings：设置文件格式坏掉时直接报错，并带上文件路径', async () => {
-  // 「格式坏了」与「值不对」是两回事：前者是技术故障、数据不可信，继续渲染一份
-  // 半真半假的报告只会让人照着它做判断。所以直接抛，并把**文件路径**带出去让用户自己修。
+test('sql_settings：报告里指路到插件设置页（不再提配置文件）', async () => {
+  // 配置编辑已经搬到设置页，落盘位置（profile 的 cordis.patch.yml）是宿主的内部实现 ——
+  // 报告里不该再出现文件路径让人去手改。
   const box = makeSandbox()
-  try {
-    writeFileSync(box.settingsPath, '{ 坏掉的 JSON', 'utf8')
-    await assert.rejects(
-      () => box.tool('sql_settings').execute({}),
-      /不是合法 JSON/,
-      '格式坏了应当直接抛错',
-    )
-    await assert.rejects(
-      () => box.tool('sql_settings').execute({}),
-      new RegExp(box.settingsPath.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')),
-      '报错里要带文件路径，否则用户不知道去修哪个文件',
-    )
-  } finally { box.cleanup() }
+  const value = await box.tool('sql_settings').execute({})
+  assert.match(value.report, /配置位置 \| 插件设置页/)
+  assert.doesNotMatch(value.report, /settings\.json|\.dsh[\\/]sql/)
 })
 
 test('sql_settings：值不对（不是格式坏）时照常渲染，只在问题节里指路', async () => {
-  // 与上一条对照：新装时配置全空是**正常的中间状态**，不该变成一片报错。
+  // 新装时配置全空是**正常的中间状态**，不该变成一片报错。
   const box = makeSandbox()
-  try {
-    const value = await box.tool('sql_settings').execute({})
-    assert.match(value.report, /^# dsh-sql/, '仍然给出报告')
-    assert.match(value.report, /## ⚠ 问题/, '问题集中放在末尾')
-    assert.match(value.report, /activeEnv 未设置.*sql_config_set/)
-    // 环境单列一节；当前环境与环境清单**不再**在「全局设置」里重复（跟 api-call 一致）
-    assert.match(value.report, /## 环境\n（空）/, '环境为空时这一节直接写（空）')
-    assert.doesNotMatch(value.report, /\| 当前环境 \|/)
-    assert.doesNotMatch(value.report, /\| 环境清单 \|/)
-  } finally { box.cleanup() }
+  const value = await box.tool('sql_settings').execute({})
+  assert.match(value.report, /^# dsh-sql/, '仍然给出报告')
+  assert.match(value.report, /## ⚠ 问题/, '问题集中放在末尾')
+  assert.match(value.report, /activeEnv 未设置.*插件设置页/)
+  // 环境单列一节；当前环境与环境清单**不再**在「全局设置」里重复（跟 api-call 一致）
+  assert.match(value.report, /## 环境\n（空）/, '环境为空时这一节直接写（空）')
+  assert.doesNotMatch(value.report, /\| 当前环境 \|/)
+  assert.doesNotMatch(value.report, /\| 环境清单 \|/)
 })
 
 test('sql_settings：连接表的环境列，空 env 显示「不限环境」（不是空格子）', async () => {
   // env 为空串/只有空白都算"不限环境"（切分逻辑就是这么判的），表格必须跟它一致。
   // 从前这里用 `??` 兜底，只认 undefined/null，空串会渲染成一个空格子 —— 看着像漏填。
   const box = makeSandbox()
-  try {
-    await box.tool('sql_config_set').execute({ environments: ['qa'] })
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'no-env' }))
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'blank-env', env: '   ' }))
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'in-qa', env: 'qa' }))
-    await box.tool('sql_config_set').execute({ activeEnv: 'qa' })
+  box.write({
+    environments: envs('qa'),
+    activeEnv: 'qa',
+    connections: {
+      'no-env': conn(),
+      'blank-env': conn({ env: '   ' }),
+      'in-qa': conn({ env: 'qa' }),
+    },
+  })
 
-    const value = await box.tool('sql_settings').execute({})
-    assert.match(value.report, /\| no-env \| sqlite \| 不限环境 \|/, '没写 env')
-    assert.match(value.report, /\| blank-env \| sqlite \| 不限环境 \|/, '只有空白也算不限环境')
-    assert.match(value.report, /\| in-qa \| sqlite \| qa \|/, '有 env 就直接写环境名')
-    assert.doesNotMatch(value.report, /\|  {2,}\|/, '不该再有空格子')
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：新增连接并落盘', async () => {
-  const box = makeSandbox()
-  try {
-    const out = await box.tool('sql_connection_set').execute(
-      connArgs({ name: 'qa', engine: 'mysql', host: '10.0.0.1', port: 3307, user: 'u', password: 'p', database: 'app' }),
-    )
-    assert.match(out.report, /已新增连接 "qa"/)
-    const written = box.read()
-    const qa = box.conn('qa')
-    assert.equal(qa.engine, 'mysql')
-    assert.equal(qa.host, '10.0.0.1')
-    assert.equal(qa.port, 3307)
-    assert.equal(qa.database, 'app')
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：同名覆盖，不产生重复项', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'qa', file: '/a.db' }))
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'qa', file: '/b.db' }))
-    const written = box.read()
-    assert.deepEqual(Object.keys(written.connections).filter((k) => k === 'qa'), ['qa'], '键唯一，天然不重复')
-    assert.equal(box.conn('qa').file, '/b.db')
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：名字区分大小写（QA 与 qa 是两条）', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'qa', file: '/a.db' }))
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'QA', file: '/b.db' }))
-    assert.equal(box.conn('qa').file, '/a.db')
-    assert.equal(box.conn('QA').file, '/b.db')
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：引擎非法报错且不落盘', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_settings').execute({})   // 先生成出厂设置
-    const before = box.read()
-    await assert.rejects(
-      () => box.tool('sql_connection_set').execute(connArgs({ name: 'x', engine: 'oracle' })),
-      /engine 必须是 sqlite \/ mysql \/ postgres/,
-    )
-    assert.deepEqual(box.read(), before, '校验失败不该改文件')
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：必填项按引擎区分（mysql 不要 database，postgres 要）', async () => {
-  const box = makeSandbox()
-  try {
-    // postgres 必填 host、port、database
-    await assert.rejects(
-      () => box.tool('sql_connection_set').execute({ name: 'pg', engine: 'postgres' }),
-      (error) => {
-        assert.match(error.message, /缺少必填字段/)
-        assert.match(error.message, /host/)
-        assert.match(error.message, /port/)
-        assert.match(error.message, /database/)
-        assert.match(error.message, /请用 sql_connection_set 补全/)
-        return true
-      },
-    )
-    // mysql 只要 host、port 是**值必填** —— 不指定默认库也能用全限定名查询，
-    // 但 key 仍要落下来（新建要求字段齐全），空串即可
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'my', engine: 'mysql', host: 'h', port: 3306, database: '' }))
-    assert.equal(box.conn('my').database, '', 'mysql 不因 database 是空串被拦')
-    // 但 mysql 缺 host / port 仍要报错
-    await assert.rejects(
-      () => box.tool('sql_connection_set').execute({ name: 'my2', engine: 'mysql' }),
-      /缺少必填字段.*host/,
-    )
-    // sqlite 必须有 file
-    await assert.rejects(
-      () => box.tool('sql_connection_set').execute({ name: 'sq', engine: 'sqlite' }),
-      /缺少必填字段.*file/,
-    )
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：user / password 不拦 —— 有的库确实不要密码', async () => {
-  const box = makeSandbox()
-  try {
-    // 不给 user / password 的**值**也能写入（传空串）；是否连得上交给数据库报错
-    await box.tool('sql_connection_set').execute(
-      connArgs({ name: 'nopw', engine: 'postgres', host: 'h', port: 5432, database: 'd', user: '', password: '' }),
-    )
-    const conn = box.conn('nopw')
-    assert.ok(conn !== undefined)
-    assert.equal(conn.user, '', '空串原样写入，不凭空造值')
-    assert.equal(conn.password, '', '空串原样写入，不凭空造值')
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：密码可走 DSH_SQL_PASSWORD_<NAME> 环境变量顶替', async () => {
-  const box = makeSandbox()
-  const key = 'DSH_SQL_PASSWORD_ENVPG'
-  const before = process.env[key]
-  try {
-    process.env[key] = 'from-env'
-    await box.tool('sql_connection_set').execute(
-      connArgs({ name: 'envpg', engine: 'mysql', host: 'h', port: 3306, user: 'u', database: 'd', password: '' }),
-    )
-    assert.ok(box.conn('envpg') !== undefined, '环境变量提供了密码就不算缺')
-  } finally {
-    if (before === undefined) delete process.env[key]
-    else process.env[key] = before
-    box.cleanup()
-  }
-})
-
-test('sql_connection_set：部分更新 —— 未给的字段保持不变（password 不会被清掉）', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_connection_set').execute(
-      connArgs({ name: 'qa', engine: 'mysql', host: '10.0.0.1', port: 3306, user: 'u', password: 'secret', database: 'app' }),
-    )
-    // 只改 readOnly，其余一律不动
-    const out = await box.tool('sql_connection_set').execute({ name: 'qa', readOnly: true })
-
-    assert.match(out.report, /已更新连接 "qa"/)
-    const qa = box.conn('qa')
-    assert.equal(qa.readOnly, true, 'readOnly 应已更新')
-    assert.equal(qa.password, 'secret', 'password 必须保留')
-    assert.equal(qa.user, 'u', 'user 必须保留')
-    assert.equal(qa.host, '10.0.0.1', 'host 必须保留')
-    assert.equal(qa.port, 3306, 'port 必须保留')
-    assert.equal(qa.database, 'app', 'database 必须保留')
-    assert.equal(qa.engine, 'mysql', 'engine 必须保留')
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：空串就是空串（不做清空语义）', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_connection_set').execute(
-      connArgs({ name: 'qa', engine: 'mysql', host: 'h', port: 3306, user: 'u', password: 'p', database: 'app', description: '备注' }),
-    )
-    await box.tool('sql_connection_set').execute({ name: 'qa', description: '' })
-
-    const qa = box.conn('qa')
-    assert.equal(qa.description, '', '空串原样写入')
-    assert.equal(qa.database, 'app', '未提及的 database 不受影响')
-    assert.equal(qa.password, 'p', '未提及的 password 不受影响')
-    assert.equal(qa.host, 'h', '未提及的 host 不受影响')
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：sqlite 必须显式给 file，不给就报错', async () => {
-  const box = makeSandbox()
-  try {
-    await assert.rejects(
-      () => box.tool('sql_connection_set').execute({ name: 'a', engine: 'sqlite' }),
-      /缺少必填字段.*file/,
-      '不再兜底成 :memory:',
-    )
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'b', file: '/tmp/b.db' }))
-    assert.equal(box.conn('b').file, '/tmp/b.db')
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：新建时字段 key 全部落进配置（没传的补空串）', async () => {
-  const box = makeSandbox()
-  try {
-    // 只给必填 -> 其余 key 被补出来，值留空，**不报错**
-    await box.tool('sql_connection_set').execute({ name: 'a', engine: 'sqlite', file: '/x.db' })
-    const a = box.conn('a')
-    for (const key of ['engine', 'file', 'env', 'description', 'readOnly']) {
-      assert.ok(Object.hasOwn(a, key), `sqlite 应落下 ${key}`)
-    }
-    assert.equal(a.env, '')
-    assert.equal(a.description, '')
-    assert.equal(a.readOnly, true, 'readOnly 补 true —— 不写就是只读')
-
-    // mysql：user / password / database 也补出来
-    await box.tool('sql_connection_set').execute({ name: 'c', engine: 'mysql', host: 'h', port: 3306 })
-    const c = box.conn('c')
-    for (const key of ['engine', 'host', 'port', 'user', 'password', 'database', 'env', 'description', 'readOnly']) {
-      assert.ok(Object.hasOwn(c, key), `mysql 应落下 ${key}`)
-    }
-    assert.equal(c.user, '')
-    assert.equal(c.database, '')
-
-    // 不适用范围**不补**：sqlite 不该凭空长出 host
-    assert.equal(Object.hasOwn(a, 'host'), false, 'sqlite 不长 host')
-    assert.equal(Object.hasOwn(c, 'file'), false, 'mysql 不长 file')
-
-    // 编辑**不受**影响 —— 「不传=不动」，也不补新 key
-    const raw = box.read()
-    raw.connections.legacy = { engine: 'sqlite', file: ':memory:' }
-    writeFileSync(box.settingsPath, JSON.stringify(raw, null, 2))
-    await box.tool('sql_connection_set').execute(partialArgs({ name: 'legacy', description: '改一下' }))
-    const legacy = box.conn('legacy')
-    assert.equal(legacy.description, '改一下')
-    assert.equal(Object.hasOwn(legacy, 'env'), false, '编辑不补 key')
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：port 不会被补空 —— 缺了照旧报必填', async () => {
-  const box = makeSandbox()
-  try {
-    // port 没有"空"可言（0 不是合法端口），补假值只会蒙混过关，所以它仍走必填校验
-    await assert.rejects(
-      () => box.tool('sql_connection_set').execute({ name: 'd', engine: 'mysql', host: 'h' }),
-      /缺少必填字段.*port/,
-    )
-    // host 是值必填 —— 补 key 之后仍然要拦住空值
-    await assert.rejects(
-      () => box.tool('sql_connection_set').execute({ name: 'e', engine: 'mysql', host: '', port: 3306 }),
-      /缺少必填字段.*host/,
-    )
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：新建必须给 engine', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_settings').execute({})
-    const before = box.read()
-    await assert.rejects(
-      () => box.tool('sql_connection_set').execute({ name: 'noengine' }),
-      /新建连接必须给 engine/,
-    )
-    assert.deepEqual(box.read(), before, '报错不该改文件')
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：engine 不可改（要换引擎只能删掉重建）', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'keep', engine: 'mysql', host: 'h', port: 3306 }))
-    const before = box.read()
-
-    // sqlite <- mysql：拦住
-    await assert.rejects(
-      () => box.tool('sql_connection_set').execute({ name: 'keep', engine: 'sqlite', file: '/tmp/s.db' }),
-      /已是 mysql，不能改成 sqlite.*删掉重建/s,
-    )
-    // postgres <- mysql：同样拦住
-    await assert.rejects(
-      () => box.tool('sql_connection_set').execute({ name: 'keep', engine: 'postgres' }),
-      /已是 mysql，不能改成 postgres/,
-    )
-    assert.deepEqual(box.read(), before, '报错不该改文件')
-
-    // 传**相同**的 engine 不算改 —— 照常编辑
-    await box.tool('sql_connection_set').execute({ name: 'keep', engine: 'mysql', database: 'app' })
-    assert.equal(box.conn('keep').database, 'app')
-    assert.equal(box.conn('keep').engine, 'mysql')
-
-    // 不传 engine 也是「不动」
-    await box.tool('sql_connection_set').execute(partialArgs({ name: 'keep', description: 'x' }))
-    assert.equal(box.conn('keep').engine, 'mysql')
-
-    // 删掉重建：这就是换引擎的正路
-    await box.tool('sql_connection_remove').execute({ name: 'keep' })
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'keep', engine: 'sqlite', file: '/tmp/s.db' }))
-    assert.equal(box.conn('keep').engine, 'sqlite')
-    assert.equal(box.conn('keep').file, '/tmp/s.db')
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：description 超 100 字符直接报错（不截断）', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_settings').execute({})
-    const before = box.read()
-    await assert.rejects(
-      () => box.tool('sql_connection_set').execute(connArgs({ name: 'a', description: 'x'.repeat(150) })),
-      /description 最长 100 字符，收到 150 字符/,
-    )
-    assert.deepEqual(box.read(), before, '报错不该改文件')
-
-    // 恰好 100 字符可以通过
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'b', description: 'y'.repeat(100) }))
-    const b = box.conn('b')
-    assert.equal(b.description.length, 100)
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_remove：删除连接并落盘', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'gone' }))
-    const out = await box.tool('sql_connection_remove').execute({ name: 'gone' })
-    assert.match(out.report, /已删除连接 "gone"/)
-    assert.equal(Object.hasOwn(box.read().connections, 'gone'), false)
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_remove：不存在的连接报错并列出可用项', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'real' }))
-    await assert.rejects(
-      () => box.tool('sql_connection_remove').execute({ name: 'nope' }),
-      /连接 "nope" 不存在.*real/s,
-    )
-  } finally { box.cleanup() }
-})
-
-test('sql_config_set：改 maxRows 并落盘', async () => {
-  const box = makeSandbox()
-  try {
-    const out = await box.tool('sql_config_set').execute({ maxRows: 250 })
-    assert.match(out.report, /maxRows=250/)
-    assert.equal(box.read().maxRows, 250)
-  } finally { box.cleanup() }
-})
-
-test('sql_config_set：不给任何字段报错', async () => {
-  const box = makeSandbox()
-  try {
-    await assert.rejects(() => box.tool('sql_config_set').execute({}), /至少要给/)
-  } finally { box.cleanup() }
-})
-
-test('sql_config_set：超范围报错且不落盘', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_settings').execute({})
-    const before = box.read()
-    await assert.rejects(() => box.tool('sql_config_set').execute({ maxRows: 99999 }), /1~10000/)
-    assert.deepEqual(box.read(), before)
-  } finally { box.cleanup() }
-})
-
-test('数值字段只收真正的 number，不做隐式转换', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_settings').execute({})
-    // Number(true) === 1、Number('5') === 5 都能「算」出合法值，静默接受会写坏配置
-    await assert.rejects(() => box.tool('sql_config_set').execute({ maxRows: true }), /必须是 1~10000 之间的数字/)
-    await assert.rejects(() => box.tool('sql_config_set').execute({ maxRows: '500' }), /必须是 1~10000 之间的数字/)
-    await assert.rejects(
-      () => box.tool('sql_connection_set').execute(connArgs({ name: 'p', port: '3306' })),
-      /port 必须是正整数/,
-    )
-  } finally { box.cleanup() }
-})
-
-test('readOnly 只收布尔值 —— 传字符串不能静默变成可写', async () => {
-  const box = makeSandbox()
-  try {
-    // 先建一条**只读**连接，好验证非法输入不会把它悄悄改成可写
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'r', readOnly: true }))
-    // 旧实现是 value === true，传 'true' 会落盘 readOnly: false（想开只读却得到可写连接）
-    await assert.rejects(
-      () => box.tool('sql_connection_set').execute({ name: 'r', readOnly: 'true' }),
-      /readOnly 必须是布尔值/,
-    )
-    assert.equal(box.conn('r').readOnly, true, '不能被静默改成 false')
-    // 真正的布尔仍然照常工作
-    await box.tool('sql_connection_set').execute({ name: 'r', readOnly: true })
-    assert.equal(box.conn('r').readOnly, true)
-  } finally { box.cleanup() }
-})
-
-test('sql_config_set：只传已废弃的超时字段会被当成没给任何参数', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_settings').execute({})
-    await assert.rejects(
-      () => box.tool('sql_config_set').execute({ queryTimeoutMs: 30000 }),
-      /至少要给 activeEnv \/ environments \/ maxRows 之一/,
-    )
-  } finally { box.cleanup() }
-})
-
-test('闭环：工具写入的连接，sql_query 立刻能用（不重启）', async () => {
-  const box = makeSandbox()
-  try {
-    const dbFile = join(box.dir, 'live.db')
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'live', file: dbFile }))
-
-    // 每次调用都重新构建工具，模拟「新一次调用读到新设置」
-    const { tools, adapters } = buildSqlTools(() => loadSettings().settings)
-    const exec = tools.find((t) => t.name === 'sql_exec')
-    const query = tools.find((t) => t.name === 'sql_query')
-
-    await exec.execute({ sql: 'CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)', connection: 'live' })
-    await exec.execute({ sql: "INSERT INTO t (v) VALUES ('hello')", connection: 'live' })
-    const result = await query.execute({ sql: 'SELECT v FROM t', connection: 'live' })
-    assert.deepEqual(result.rows, [['hello']])
-
-    for (const adapter of adapters.values()) await adapter.close()
-  } finally { box.cleanup() }
-})
-
-test('闭环：sql_connection_remove 后该连接立刻不可用', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'temp', file: join(box.dir, 'temp.db') }))
-    await box.tool('sql_connection_remove').execute({ name: 'temp' })
-
-    const { tools } = buildSqlTools(() => loadSettings().settings)
-    const query = tools.find((t) => t.name === 'sql_query')
-    await assert.rejects(() => query.execute({ sql: 'SELECT 1', connection: 'temp' }), /未找到名为 temp/)
-  } finally { box.cleanup() }
-})
-
-test('闭环：sql_config_set 改的 maxRows 立刻生效', async () => {
-  const box = makeSandbox()
-  try {
-    const dbFile = join(box.dir, 'cap.db')
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'cap', file: dbFile }))
-
-    const first = buildSqlTools(() => loadSettings().settings)
-    const exec = first.tools.find((t) => t.name === 'sql_exec')
-    await exec.execute({ sql: 'CREATE TABLE t (id INTEGER PRIMARY KEY)', connection: 'cap' })
-    await exec.execute({ sql: 'INSERT INTO t (id) VALUES (1),(2),(3)', connection: 'cap' })
-
-    await box.tool('sql_config_set').execute({ maxRows: 2 })
-
-    const second = buildSqlTools(() => loadSettings().settings)
-    const query = second.tools.find((t) => t.name === 'sql_query')
-    const result = await query.execute({ sql: 'SELECT * FROM t', connection: 'cap' })
-    assert.equal(result.maxRows, 2)
-    assert.equal(result.truncated, true)
-    assert.equal(result.rows.length, 2)
-
-    // 先关掉 SQLite 句柄，否则 Windows 上临时目录删不掉
-    for (const adapter of first.adapters.values()) await adapter.close()
-    for (const adapter of second.adapters.values()) await adapter.close()
-  } finally { box.cleanup() }
-})
-
-test('settingsFile 受 DSH_SQL_SETTINGS_DIR 控制', () => {
-  const box = makeSandbox()
-  try {
-    assert.equal(settingsFile(), join(box.dir, SETTINGS_FILE_NAME))
-  } finally { box.cleanup() }
+  const value = await box.tool('sql_settings').execute({})
+  assert.match(value.report, /\| no-env \| sqlite \| 不限环境 \|/, '没写 env')
+  assert.match(value.report, /\| blank-env \| sqlite \| 不限环境 \|/, '只有空白也算不限环境')
+  assert.match(value.report, /\| in-qa \| sqlite \| qa \|/, '有 env 就直接写环境名')
+  assert.doesNotMatch(value.report, /\|  {2,}\|/, '不该再有空格子')
 })
 
 // ── activeEnv / environments ───────────────────────────────────────────────
 
-test('出厂设置：activeEnv 与 environments 都是空', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_settings').execute({})
-    const written = box.read()
-    assert.equal(written.activeEnv, '')
-    assert.deepEqual(written.environments, [])
-  } finally { box.cleanup() }
-})
-
-test('sql_config_set：写 environments（去重、去空）', async () => {
-  const box = makeSandbox()
-  try {
-    const out = await box.tool('sql_config_set').execute({ environments: ['qa', 'qa', 'prod'] })
-    assert.match(out.report, /environments=qa、prod/)
-    assert.deepEqual(box.read().environments, ['qa', 'prod'])
-  } finally { box.cleanup() }
-})
-
-test('sql_config_set：environments 非数组或含空元素时报错', async () => {
-  const box = makeSandbox()
-  try {
-    await assert.rejects(() => box.tool('sql_config_set').execute({ environments: 'qa' }), /必须是字符串数组/)
-    await assert.rejects(() => box.tool('sql_config_set').execute({ environments: ['qa', ''] }), /只能是非空字符串/)
-    await assert.rejects(() => box.tool('sql_config_set').execute({ environments: ['qa', 1] }), /只能是非空字符串/)
-  } finally { box.cleanup() }
-})
-
-test('sql_config_set：activeEnv 必须在 environments 里', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_config_set').execute({ environments: ['qa', 'prod'] })
-    await assert.rejects(
-      () => box.tool('sql_config_set').execute({ activeEnv: 'uat' }),
-      /activeEnv "uat" 不在 environments 里（可选: qa, prod）/,
-    )
-    const ok = await box.tool('sql_config_set').execute({ activeEnv: 'qa' })
-    assert.match(ok.report, /activeEnv=qa/)
-    assert.equal(box.read().activeEnv, 'qa')
-  } finally { box.cleanup() }
-})
-
-test('sql_config_set：反向校验 —— 改 environments 不能把当前 activeEnv 挤掉', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_config_set').execute({ environments: ['qa', 'prod'] })
-    await box.tool('sql_config_set').execute({ activeEnv: 'qa' })
-
-    const before = box.read()
-    await assert.rejects(
-      () => box.tool('sql_config_set').execute({ environments: ['prod'] }),
-      /activeEnv "qa" 不在 environments 里/,
-    )
-    assert.deepEqual(box.read(), before, '校验失败不该改文件')
-
-    // 同批把 activeEnv 一起改走就放行
-    const ok = await box.tool('sql_config_set').execute({ environments: ['prod'], activeEnv: 'prod' })
-    assert.match(ok.report, /activeEnv=prod/)
-    assert.equal(box.read().activeEnv, 'prod')
-  } finally { box.cleanup() }
-})
-
-test('sql_config_set：清空 environments 不再连带清掉 activeEnv，而是要求同一次调用里一起处理', async () => {
-  // 从前这里会"连带清空 activeEnv" —— 那是个自作主张的隐式副作用：清空清单的意图
-  // 只是"不要这些环境了"，未必包含"顺便把我的当前环境也抹掉"。
-  // 现在全走同一套单向校验：activeEnv 必须落在最终的 environments 里。
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_config_set').execute({ environments: ['qa', 'prod'] })
-    await box.tool('sql_config_set').execute({ activeEnv: 'qa' })
-
-    // 只清清单、不管 activeEnv → 拦下，并告诉怎么办
-    await assert.rejects(
-      () => box.tool('sql_config_set').execute({ environments: [] }),
-      /activeEnv "qa" 不在 environments 里.*把 activeEnv 传空串/s,
-    )
-    assert.deepEqual(box.read().environments, ['qa', 'prod'], '被拒的写入不能留痕')
-    assert.equal(box.read().activeEnv, 'qa')
-
-    // 同一次调用里把 activeEnv 一并传空 → 放行
-    const out = await box.tool('sql_config_set').execute({ environments: [], activeEnv: '' })
-    assert.match(out.report, /environments=（空）/)
-    assert.deepEqual(box.read().environments, [])
-    assert.equal(box.read().activeEnv, '')
-  } finally { box.cleanup() }
-})
-
-test('sql_config_set：activeEnv 传空串可单独清空', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_config_set').execute({ environments: ['qa'] })
-    await box.tool('sql_config_set').execute({ activeEnv: 'qa' })
-    await box.tool('sql_config_set').execute({ activeEnv: '' })
-    assert.equal(box.read().activeEnv, '')
-    assert.deepEqual(box.read().environments, ['qa'], '清单不受影响')
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：env 必须出自 environments', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_settings').execute({})
-    const before = box.read()
-    await assert.rejects(
-      () => box.tool('sql_connection_set').execute(connArgs({ name: 'x', env: 'qa' })),
-      /env "qa" 不在 environments 里（可选: （空））/,
-    )
-    assert.deepEqual(box.read(), before, '报错不该改文件')
-
-    await box.tool('sql_config_set').execute({ environments: ['qa'] })
-    const ok = await box.tool('sql_connection_set').execute(connArgs({ name: 'x', env: 'qa' }))
-    assert.match(ok.report, /已新增连接 "x"/)
-    assert.equal(box.conn('x').env, 'qa')
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：env 空串合法（不限定环境）', async () => {
-  const box = makeSandbox()
-  try {
-    // 新建：传空串 → 原样落盘，文件里看得见"这个连接没限定环境"
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'any' }))
-    assert.equal(box.conn('any').env, '')
-
-    // 存量老配置（本来没有 env 字段）编辑时**不补** —— 不把「这次没提」变成静默重置
-    const raw = box.read()
-    raw.connections.legacy = { engine: 'sqlite', file: ':memory:' }
-    writeFileSync(box.settingsPath, JSON.stringify(raw, null, 2))
-    await box.tool('sql_connection_set').execute(partialArgs({ name: 'legacy', file: '/tmp/legacy.db' }))
-    assert.equal(Object.hasOwn(box.conn('legacy'), 'env'), false)
-  } finally { box.cleanup() }
-})
-
-test('sql_config_set：删环境时提示还在用它的连接', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_config_set').execute({ environments: ['qa', 'prod'] })
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'a', env: 'qa' }))
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'b', env: 'prod' }))
-
-    const out = await box.tool('sql_config_set').execute({ environments: ['prod'], activeEnv: 'prod' })
-    assert.match(out.report, /环境 "qa" 已移除，但仍有连接在用它：a/)
-  } finally { box.cleanup() }
-})
-
 test('sql_settings：按 activeEnv 筛选，留空的连接哪个环境都列', async () => {
   const box = makeSandbox()
-  try {
-    await box.tool('sql_config_set').execute({ environments: ['qa', 'prod'] })
-    await box.tool('sql_config_set').execute({ activeEnv: 'qa' })
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'qa-only', env: 'qa' }))
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'prod-only', env: 'prod' }))
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'anywhere' }))
+  box.write({
+    environments: envs('qa', 'prod'),
+    activeEnv: 'qa',
+    connections: {
+      'qa-only': conn({ env: 'qa' }),
+      'prod-only': conn({ env: 'prod' }),
+      anywhere: conn(),
+    },
+  })
 
-    const value = await box.tool('sql_settings').execute({})
-    assert.match(value.report, /当前环境 qa/)
-    // 当前环境可用：qa-only + anywhere（留空）；prod-only 不在表里
-    assert.match(value.report, /qa-only/)
-    assert.match(value.report, /anywhere/)
-    assert.match(value.report, /其它环境的连接：prod-only/)
-    // prod-only 只出现在「其它环境」那行，不进表
-    const tableRows = value.report.split('\n').filter((line) => line.startsWith('| ') && line.includes('| sqlite |'))
-    assert.equal(tableRows.some((row) => row.includes('prod-only')), false)
-  } finally { box.cleanup() }
+  const value = await box.tool('sql_settings').execute({})
+  assert.match(value.report, /当前环境 qa/)
+  // 当前环境可用：qa-only + anywhere（留空）；prod-only 不在表里
+  assert.match(value.report, /qa-only/)
+  assert.match(value.report, /anywhere/)
+  assert.match(value.report, /其它环境的连接：prod-only/)
+  // prod-only 只出现在「其它环境」那行，不进表
+  const tableRows = value.report.split('\n').filter((line) => line.startsWith('| ') && line.includes('| sqlite |'))
+  assert.equal(tableRows.some((row) => row.includes('prod-only')), false)
 })
 
 test('sql_settings：activeEnv 为空时只列不限环境的，带环境的进「其它环境」', async () => {
   const box = makeSandbox()
-  try {
-    await box.tool('sql_config_set').execute({ environments: ['qa', 'prod'] })
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'qa-only', env: 'qa' }))
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'prod-only', env: 'prod' }))
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'scratch' }))
+  box.write({
+    environments: envs('qa', 'prod'),
+    connections: {
+      'qa-only': conn({ env: 'qa' }),
+      'prod-only': conn({ env: 'prod' }),
+      scratch: conn(),
+    },
+  })
 
-    const value = await box.tool('sql_settings').execute({})
-    assert.match(value.report, /当前环境（空），1 个可见连接/)
-    assert.match(value.report, /## 可见连接（不限环境）/)
-    assert.match(value.report, /scratch/)
-    assert.match(value.report, /其它环境的连接：qa-only、prod-only/)
-    assert.doesNotMatch(value.report, /\| qa-only \|/, '带环境的连接不进可用表')
-    assert.doesNotMatch(value.report, /\| prod-only \|/, '带环境的连接不进可用表')
-  } finally { box.cleanup() }
+  const value = await box.tool('sql_settings').execute({})
+  assert.match(value.report, /当前环境（空），1 个可见连接/)
+  assert.match(value.report, /## 可见连接（不限环境）/)
+  assert.match(value.report, /scratch/)
+  assert.match(value.report, /其它环境的连接：qa-only、prod-only/)
+  assert.doesNotMatch(value.report, /\| qa-only \|/, '带环境的连接不进可用表')
+  assert.doesNotMatch(value.report, /\| prod-only \|/, '带环境的连接不进可用表')
 })
 
 test('sql_settings：activeEnv 设了环境时，当前环境的 + default 的同列可用', async () => {
   const box = makeSandbox()
-  try {
-    await box.tool('sql_config_set').execute({ environments: ['qa', 'prod'], activeEnv: 'qa' })
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'qa-only', env: 'qa' }))
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'prod-only', env: 'prod' }))
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'scratch' }))
+  box.write({
+    environments: envs('qa', 'prod'),
+    activeEnv: 'qa',
+    connections: {
+      'qa-only': conn({ env: 'qa' }),
+      'prod-only': conn({ env: 'prod' }),
+      scratch: conn(),
+    },
+  })
 
-    const value = await box.tool('sql_settings').execute({})
-    assert.match(value.report, /当前环境 qa，2 个可见连接/)
-    assert.match(value.report, /## 可见连接（当前环境 qa）/)
-    assert.match(value.report, /\| qa-only \|/)
-    assert.match(value.report, /\| scratch \|/, '不限环境的连接在任何环境都可用')
-    assert.match(value.report, /其它环境的连接：prod-only/)
-  } finally { box.cleanup() }
+  const value = await box.tool('sql_settings').execute({})
+  assert.match(value.report, /当前环境 qa，2 个可见连接/)
+  assert.match(value.report, /## 可见连接（当前环境 qa）/)
+  assert.match(value.report, /\| qa-only \|/)
+  assert.match(value.report, /\| scratch \|/, '不限环境的连接在任何环境都可用')
+  assert.match(value.report, /其它环境的连接：prod-only/)
 })
 
 test('sql_settings：环境清单被改小后，落到范围外的 activeEnv / 连接 env 都在问题节报出来', async () => {
-  // 写入侧拦得住正常路径，但**手改配置文件**能绕过它 —— 读取侧必须看得见，
-  // 否则表现只是"当前环境名不对 / 某个连接凭空消失"，没人想得到是环境清单变了。
+  // 设置页只保证形状（schema），"activeEnv 得命中某个环境的名字"这类跨字段规则
+  // 只能在运行时判 —— 所以读取侧的「⚠ 问题」节是**主要**的发现渠道。
+  // 不说的话，表现只是"当前环境名不对 / 某个连接凭空消失"，没人想得到是环境清单变了。
   const box = makeSandbox()
-  try {
-    await box.tool('sql_config_set').execute({ environments: ['qa', 'prod'] })
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'prod-db', env: 'prod' }))
-    await box.tool('sql_config_set').execute({ activeEnv: 'prod' })
+  box.write({
+    environments: envs('qa', 'prod'),
+    activeEnv: 'prod',
+    connections: { 'prod-db': conn({ env: 'prod' }) },
+  })
 
-    // 手工把 prod 从清单里删掉（绕过写入侧校验）
-    const raw = box.read()
-    raw.environments = ['qa']
-    writeFileSync(box.settingsPath, JSON.stringify(raw, null, 2), 'utf8')
+  // 模拟"在设置页删了环境但没改引用"：换一份少一个环境的配置
+  box.write({ ...box.read(), environments: envs('qa') })
 
-    const value = await box.tool('sql_settings').execute({})
-    assert.match(value.report, /activeEnv "prod" 不在环境清单里/, '当前环境指向了不存在的环境')
-    assert.match(value.report, /连接 "prod-db" 的 env "prod" 不在环境清单里/, '连接的 env 也指向了不存在的环境')
-    assert.match(value.report, /它在任何环境下都不会出现/, '要说清后果，否则看不出严重性')
-    // 两条都要带指路（该用哪个工具改）
-    assert.match(value.report, /sql_config_set/)
-    assert.match(value.report, /sql_connection_set/)
-  } finally { box.cleanup() }
-})
-
-test('sql_connection_set：env 必须在环境清单里（空串除外）', async () => {
-  const box = makeSandbox()
-  try {
-    await box.tool('sql_config_set').execute({ environments: ['qa', 'prod'] })
-    // 清单外的名字当场拦下，并给出可选值
-    await assert.rejects(
-      () => box.tool('sql_connection_set').execute(connArgs({ name: 'x', env: 'ghost' })),
-      /env "ghost" 不在 environments 里（可选: qa, prod）/,
-    )
-    // 空串 = 不限环境，不校验
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'free', env: '' }))
-    assert.equal(box.conn('free').env, '', '空串允许（不限环境）')
-    // 清单里的名字正常写入
-    await box.tool('sql_connection_set').execute(connArgs({ name: 'in-qa', env: 'qa' }))
-    assert.equal(box.conn('in-qa').env, 'qa')
-  } finally { box.cleanup() }
+  const value = await box.tool('sql_settings').execute({})
+  assert.match(value.report, /activeEnv "prod" 不在环境清单里/, '当前环境指向了不存在的环境')
+  assert.match(value.report, /连接 "prod-db" 的 env "prod" 不在环境清单里/, '连接的 env 也指向了不存在的环境')
+  assert.match(value.report, /它在任何环境下都不会出现/, '要说清后果，否则看不出严重性')
+  // 两条都要带指路（该去哪儿改）—— 配置编辑已经全在设置页
+  assert.match(value.report, /插件设置页/)
 })
 
 test('sql_settings：环境未配置时给出软提示，且不引导手动编辑', async () => {
   const box = makeSandbox()
-  try {
-    const value = await box.tool('sql_settings').execute({})
-    assert.match(value.report, /## ⚠ 问题/)
-    assert.match(value.report, /environments 为空，请先用 sql_config_set 配置环境清单。/)
-    // 提示带上可选值（现在清单为空，所以是（空））—— 跟 api-call 一致
-    assert.match(value.report, /activeEnv 未设置，请先用 sql_config_set 指定当前环境（可选: （空））。/)
-    assert.doesNotMatch(value.report, /手动|编辑文件|settings\.json 里填/)
-  } finally { box.cleanup() }
+  const value = await box.tool('sql_settings').execute({})
+  assert.match(value.report, /## ⚠ 问题/)
+  assert.match(value.report, /environments 为空，请先在插件设置页添加环境。/)
+  // 提示带上可选值（现在清单为空，所以是（空））—— 跟 api-call 一致
+  assert.match(value.report, /activeEnv 未设置，请先在插件设置页指定当前环境（可选: （空））。/)
+  assert.doesNotMatch(value.report, /手动|编辑文件|settings\.json 里填/)
 })
+

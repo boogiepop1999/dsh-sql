@@ -1,44 +1,51 @@
-import { type SqlSettings } from './config.js';
-/** 设置文件名。 */
-export declare const SETTINGS_FILE_NAME = "settings.json";
-/** 覆盖设置文件目录的环境变量（测试隔离用，避免碰真实 $DSH_HOME）。 */
-export declare const SETTINGS_DIR_ENV = "DSH_SQL_SETTINGS_DIR";
-/** 插件数据目录；`DSH_SQL_SETTINGS_DIR` 可整体覆盖。 */
-export declare function pluginDataDir(env?: NodeJS.ProcessEnv): string;
-/** 设置文件路径。 */
-export declare function settingsFile(env?: NodeJS.ProcessEnv): string;
-/** 原子写 JSON：先写临时文件再 rename，避免留下半截文件。 */
-export declare function writeJsonAtomic(file: string, value: unknown): void;
 /**
- * 规范化设置：**只查顶层形状 + 剔未知字段**，不管内部字段的对错。
+ * dsh-sql 配置 —— **纯函数与形状约束**，不含任何 I/O。
  *
- * 读与写都走这一份 —— **没有 trim、没有类型过滤、不补默认值**。这样"读到的"就是
- * "写入的"，不存在两套形状不同的数据（早先这里还有个 `resolveSettings` 专门给运行时
- * 做归一化，导致同一个文件读出来两个样子，已删）。
+ * ## 值的来源与去向
  *
- * 唯一替下游兜的是 `connections` 缺失时补 `{}` —— 下游到处写 `settings.connections[name]`，
- * undefined 会直接崩。
+ *   读：宿主 `settings` 服务里名为 `sql` 的命名空间（= profile 条目 id）
+ *   写：设置页表单（`src/client.ts`）→ `scope.mutate(ops)` → 宿主校验 → 原子写
+ *       `profiles/<p>/cordis.patch.yml` → Loader 热重载
  *
- * 其余字段的兜底/校验都在**使用处**：`isReadOnly()` 按 fail-safe 判只读、
- * `requireMaxRows()` 校验行数上限、`resolveConnection()` 合流密码环境变量。
+ * 配置对象由 `apply(ctx, config)` 拿到，工具**每次调用时现取**（见 `index.ts` 的
+ * `configReader`），所以"改完下一次调用生效"成立 —— 刷新时机由宿主的文档镜像决定。
+ *
+ * ## 从前这里有文件 I/O
+ *
+ * 0.4.x 时配置在 `$DSH_HOME/sql/settings.json`，这个文件负责读写它
+ * （`loadSettings` / `saveSettings` / `writeJsonAtomic` / `pluginDataDir`）。
+ * 那些**全部删除**了：写进去宿主的 settings 服务（带 schema 校验、revision 栅栏、
+ * 失败回滚），读也从宿主配置来 —— 两套数据源迟早会分不清谁是真的（真出过：
+ * 设置页显示 5 个连接、而工具有的是空配置）。
+ *
+ * @module dsh-sql/settings
+ */
+import type { SqlSettings } from './config.js';
+/**
+ * 规范化配置：**只查顶层形状 + 剔未知字段**，不管内部字段的对错。
+ *
+ * 值的来源是宿主的文档（可能缺字段、可能带我们不认识的键），所以这一步是必要的收口：
+ * 把"不是我们的字段"滤掉，把"必须存在的容器"补齐。
+ *
+ * **没有 trim、没有类型过滤、不补标量默认值** —— 补默认值会让"未设置"与"设成了默认值"
+ * 变得无法区分，而报告里恰恰要区分这两件事（见 `sql_settings` 末尾的「⚠ 问题」节）。
+ * 标量的缺省由 `src/config-schema.ts` 的 `.default()` 在**保存时**完成，
+ * 跟这里读取时的形状收口不是一回事。
+ *
+ * ⚠ `environments` **只认「id → { name }」的新形状**，不接受 0.4.x 的 `string[]`。
+ *   数组只能整组替换，而设置页要用深路径 op 增删改单个环境（见 config-schema.ts）。
+ *   旧形状在这里被拦下并指出该怎么改，而不是静默转一份出来 —— 转出来的 id 是随机的，
+ *   用户下次打开设置页会看到一堆不认识的键，反而更迷惑。
  */
 export declare function normalizeSettings(raw: unknown): SqlSettings;
-/** 出厂设置：字段按 `SqlSettings` 最新定义**全部显式写出**，作为可直接照改的样例。 */
-export declare function defaultSettings(): SqlSettings;
-/** 读设置的结果。 */
-export interface LoadedSettings {
-    /** 设置本体 —— **读用它、写也用它，只有这一份**（没有第二套"解析后"的结果）。 */
-    settings: SqlSettings;
-    file: string;
-    /** 本次调用是否新建了文件（首次生成出厂设置）。 */
-    created: boolean;
-}
 /**
- * 读设置；文件不存在就写一份出厂设置再返回。
+ * 出厂配置 —— 字段按 `SqlSettings` 定义**全部显式写出**，作为可直接照改的样例。
  *
- * 每次调用都重新读盘 —— 换来的「改动下一次调用必然生效」不需要任何刷缓存逻辑。
- * 文件坏了直接抛错（给路径与原因），不静默回退，否则会被误当成「配置没生效」。
+ * 必须与 `src/config-schema.ts` 的 `.default()` 一致（`SQL_CONFIG_DEFAULTS` 就是
+ * 给这条约束做漂移检测用的）：一处改了另一处忘改，症状是"文件不存在的首次运行"
+ * 与"表单重置"给出不同结果。
+ *
+ * **环境与连接一律留空**：这两个是部署细节，塞占位数据只会让人先做一轮"清理"
+ * 而不是"配置"，而且假地址真会被误当能用的东西。
  */
-export declare function loadSettings(env?: NodeJS.ProcessEnv): LoadedSettings;
-/** 原子写回设置。调用方负责先 `normalizeSettings` 校验。 */
-export declare function saveSettings(settings: SqlSettings, env?: NodeJS.ProcessEnv): string;
+export declare function defaultSettings(): SqlSettings;

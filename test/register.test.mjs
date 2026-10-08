@@ -1,19 +1,21 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { apply, inject } from '../lib/index.js'
-import { SETTINGS_DIR_ENV, SETTINGS_FILE_NAME } from '../lib/index.js'
+import { apply, inject, Config } from '../lib/index.js'
 
-/** 每个测试用独立临时目录，绝不碰真实的 $DSH_HOME/sql。 */
-function makeSandbox() {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-sql-register-'))
-  process.env[SETTINGS_DIR_ENV] = dir
+/**
+ * 造一份能被插件读的配置对象。
+ *
+ * 宿主把条目的 config 交给 `apply(ctx, config)`，而 `.volatile()` 的字段上报一个
+ * `get()` —— 插件**每次调用时现取**，所以测试里也可以只给普通对象（`readConfigValue`
+ * 两种都认）。
+ */
+function makeConfig(overrides = {}) {
   return {
-    dir,
-    settingsPath: join(dir, SETTINGS_FILE_NAME),
-    cleanup() { delete process.env[SETTINGS_DIR_ENV]; rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }) },
+    activeEnv: '',
+    maxRows: 1000,
+    environments: {},
+    connections: {},
+    ...overrides,
   }
 }
 
@@ -34,74 +36,91 @@ function makeFakeCtx() {
       (listeners[event] ??= []).push(listener)
       return () => {}
     },
+    /**
+     * `ctx.inject(deps, cb)` —— 真实 Cordis 在服务可用时**调用回调**，并给它一个子级 ctx。
+     *
+     * 这里默认**不调**（模拟 settings 服务不存在：headless 组合、或服务未挂载）——
+     * 顶层那批工具必须在这种情况照常注册。要测 `sql_env_use` 时把
+     * `ctx.__withSettings` 设成 true，走服务可用的那条路。
+     */
+    inject(deps, callback) {
+      if (ctx.__withSettings) {
+        callback({ ...ctx, settings: { configure() {}, async update() {} }, fiber: {}, effect: (fn) => fn() })
+      }
+      return {}
+    },
   }
   return { ctx, registered, listeners }
 }
 
-test('inject 声明 tools', () => {
+test('inject 声明 tools（settings 不是硬依赖，走 ctx.inject 子级）', () => {
   assert.deepEqual(inject, ['tools'])
 })
 
-test('apply 注册 9 个工具（官方 register 签名）', () => {
-  const box = makeSandbox()
-  try {
-    const { ctx, registered } = makeFakeCtx()
-    apply(ctx)
-    assert.equal(registered.length, 9)
-    assert.ok(registered.every((item) => item.extra.length === 0))
-    assert.ok(registered.every((item) => !Object.hasOwn(item.definition, 'gate')))
-  } finally { box.cleanup() }
+test('导出名为 Config 的 schema —— 少了它配置页根本不会出现', () => {
+  // `dsh-settings` 读的是 `entry.fiber.runtime.Config`（见它的 `schema(entry)`）。
+  // 光 `export * from './config-schema.js'` 导出的名字是 `ConfigSchema`，宿主不认 ——
+  // 表现是**插件加载异常 / 配置节不出现**，而且没有任何报错指向这里。
+  assert.ok(Config, '必须导出 Config')
+  assert.equal(typeof Config.toJSON, 'function', 'dsh-settings 会调 toJSON()，必须是 schemastery schema')
+
+  const wire = JSON.stringify(Config.toJSON())
+  assert.ok(wire.includes('volatile'), '没有 volatile 的字段不会进表单')
+  assert.ok(wire.includes('secret'), 'password 必须是 secret，否则会下发到浏览器')
 })
 
-test('apply 首次运行时生成出厂配置文件', () => {
-  const box = makeSandbox()
-  try {
-    const { ctx } = makeFakeCtx()
-    apply(ctx)
-    const written = JSON.parse(readFileSync(box.settingsPath, 'utf8'))
-    assert.deepEqual(written.connections, {}, '出厂不带任何连接')
-    assert.equal(written.activeEnv, '')
-    assert.deepEqual(written.environments, [])
-    assert.equal(written.maxRows, 1000)
-    assert.deepEqual(Object.keys(written).sort(), ['activeEnv', 'connections', 'environments', 'maxRows'], '超时是代码常量，不该出现在设置文件里')
-  } finally { box.cleanup() }
+test('apply 注册 6 个工具（5 个数据库操作 + sql_settings）', () => {
+  const { ctx, registered } = makeFakeCtx()
+  apply(ctx, makeConfig())
+  assert.equal(registered.length, 6, 'settings 不可用时没有 sql_env_use')
+  assert.ok(registered.every((item) => item.extra.length === 0))
+  assert.ok(registered.every((item) => !Object.hasOwn(item.definition, 'gate')))
+  const names = registered.map((item) => item.definition.name).sort()
+  assert.deepEqual(names, ['sql_exec', 'sql_health', 'sql_query', 'sql_schema', 'sql_settings', 'sql_stats'])
 })
 
-test('apply 不接收配置参数（配置一律来自设置文件）', () => {
-  const box = makeSandbox()
-  try {
-    const { ctx } = makeFakeCtx()
-    assert.equal(apply.length, 1, 'apply 只应有 ctx 一个形参')
-  } finally { box.cleanup() }
+test('settings 可用时多注册 sql_env_use（唯一会写配置的工具）', () => {
+  const { ctx, registered } = makeFakeCtx()
+  ctx.__withSettings = true
+  apply(ctx, makeConfig())
+  const names = registered.map((item) => item.definition.name).sort()
+  assert.deepEqual(
+    names,
+    ['sql_env_use', 'sql_exec', 'sql_health', 'sql_query', 'sql_schema', 'sql_settings', 'sql_stats'],
+  )
+})
+
+test('apply 收 ctx + config 两个参数（配置由宿主注入，不再读文件）', () => {
+  assert.equal(apply.length, 2, 'apply(ctx, config) —— 配置走宿主，插件自己不碰文件')
 })
 
 test('不再注册 tools/pre-execute 审批钩子（插件不自带写审批）', () => {
-  const box = makeSandbox()
-  try {
-    const { ctx, listeners } = makeFakeCtx()
-    apply(ctx)
-    assert.equal(listeners['tools/pre-execute'], undefined)
-  } finally { box.cleanup() }
-})
-
-test('apply 遇到坏设置文件时响亮失败', () => {
-  const box = makeSandbox()
-  try {
-    writeFileSync(box.settingsPath, '{ 这不是 JSON', 'utf8')
-    const { ctx, registered, listeners } = makeFakeCtx()
-    assert.throws(() => apply(ctx), /不是合法 JSON/)
-    assert.equal(registered.length, 0)
-    assert.deepEqual(listeners, {})
-  } finally { box.cleanup() }
+  const { ctx, listeners } = makeFakeCtx()
+  apply(ctx, makeConfig())
+  assert.equal(listeners['tools/pre-execute'], undefined)
 })
 
 test('dispose 卸载全部工具', () => {
-  const box = makeSandbox()
-  try {
-    const { ctx, registered, listeners } = makeFakeCtx()
-    apply(ctx)
-    assert.equal(registered.length, 9)
-    for (const listener of listeners.dispose ?? []) listener()
-    assert.equal(registered.length, 0)
-  } finally { box.cleanup() }
+  const { ctx, registered, listeners } = makeFakeCtx()
+  apply(ctx, makeConfig())
+  assert.equal(registered.length, 6)
+  for (const listener of listeners.dispose ?? []) listener()
+  assert.equal(registered.length, 0)
+})
+
+test('配置是 .volatile() 的话走 get() 取当前值（改完立即生效）', () => {
+  const { ctx, registered } = makeFakeCtx()
+  let current = makeConfig({ activeEnv: 'qa' })
+  // 模拟宿主的响应式 config：get() 每次返回当前值
+  apply(ctx, { get: () => current })
+
+  const settingsTool = registered.find((i) => i.definition.name === 'sql_settings').definition
+  return settingsTool.execute({}).then((first) => {
+    assert.match(first.report, /当前环境 qa/)
+    // 宿主改配置（设置页保存 → Loader 重载）
+    current = makeConfig({ activeEnv: 'prod' })
+    return settingsTool.execute({}).then((second) => {
+      assert.match(second.report, /当前环境 prod/, '每次调用现取 —— 不能把 config 存起来')
+    })
+  })
 })

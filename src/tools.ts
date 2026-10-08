@@ -5,19 +5,18 @@
  *
  * @module dsh-sql/tools
  */
+import { defineTool, type AuthorSchema } from '@deepseek-ai/dsh-tools'
 import { createAdapter, type DatabaseAdapter } from './adapters.js'
 import { type SqlSettings, type SqlConnectionConfig, isReadOnly, requireMaxRows, passwordEnvName, splitConnectionsByEnv, QUERY_TIMEOUT_MS, EXEC_TIMEOUT_MS, STATS_TIMEOUT_MS } from './config.js'
 import { countStatements, splitStatements, stripSqlNoise } from './sql-lex.js'
 import {
   asRecord,
-  compileParameters,
   execTimeoutError,
   executionSignal,
   isAbortError,
   optionalString,
   queryTimeoutError,
   requiredString,
-  type SqlToolDefinition,
 } from './tool-kit.js'
 
 /** 只读语句关键字白名单。 */
@@ -52,12 +51,16 @@ export function assertReadQuery(sql: string): string {
   return trimmed.replace(/;+\s*$/, '').trim()
 }
 
-const querySchema = {
+const querySchema: AuthorSchema = {
   type: 'object',
   properties: {
     connection: { type: 'string' },
     columns: { type: 'array', items: { type: 'string' } },
-    rows: { type: 'array', items: { type: 'array', items: {} } },
+    // 行是"数组的数组"，单元格是任意值 —— 用作者侧的 `json`（编译成只带注释的 schema）。
+    // ⚠ 不能写 `items: {}`：宿主会 `assertSupportedJsonSchema`，空节点会被拒
+    //   （`...items.type must be string/number/... or use oneOf`）。这是**切到
+    //   defineTool 之后才暴露的** —— 从前手写的 schema 宿主根本不校验。
+    rows: { type: 'array', items: { type: 'array', items: { type: 'json' } } },
     rowCount: { type: 'integer' },
     truncated: { type: 'boolean' },
     maxRows: { type: 'integer' },
@@ -67,7 +70,7 @@ const querySchema = {
   additionalProperties: true,
 }
 
-const execSchema = {
+const execSchema: AuthorSchema = {
   type: 'object',
   properties: {
     connection: { type: 'string' },
@@ -76,7 +79,7 @@ const execSchema = {
   additionalProperties: true,
 }
 
-const schemaToolSchema = {
+const schemaToolSchema: AuthorSchema = {
   type: 'object',
   properties: {
     connection: { type: 'string' },
@@ -144,7 +147,7 @@ async function databaseSize(adapter: DatabaseAdapter, engine: string, database: 
   return Number(result.rows[0]?.[0] ?? -1)
 }
 
-const statsSchema = {
+const statsSchema: AuthorSchema = {
   type: 'object',
   properties: {
     connection: { type: 'string' },
@@ -158,7 +161,7 @@ const statsSchema = {
   additionalProperties: true,
 }
 
-const healthSchema = {
+const healthSchema: AuthorSchema = {
   type: 'object',
   properties: {
     ok: { type: 'boolean' },
@@ -201,7 +204,16 @@ function connectionFingerprint(connection: NamedSqlConnection): string {
   ].join('\u0000')
 }
 
-/** 构建工具定义；设置**每次调用现读**，adapters 按连接名缓存并按指纹失效。 */
+/**
+ * 一个 `defineTool` 产出的工具定义 —— **类型从宿主推断**，不再自己声明。
+ *
+ * 早先这里用自造的 `SqlToolDefinition`，那玩意儿的 `parameters` 是手写的 JSON Schema，
+ * 宿主**不会校验**（它的校验读的是 `defineTool` 归一化后的 schema）。
+ * 现在直接用 `ReturnType<typeof defineTool>`，跟宿主完全对齐。
+ */
+type SqlToolDefinition = ReturnType<typeof defineTool>
+
+/** 构建工具定义；配置**每次调用现读**，adapters 按连接名缓存并按指纹失效。 */
 export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDefinition[]; adapters: ReadonlyMap<string, DatabaseAdapter> } {
   /**
    * 适配器缓存：按连接名缓存，但每次比对指纹。
@@ -214,7 +226,17 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
   /** 对外暴露的适配器视图（供 dispose 关闭）。 */
   const adapters = new Map<string, DatabaseAdapter>()
 
-  /** 解析连接名 → 连接定义（不建适配器）。名字区分大小写。 */
+  /**
+   * 解析连接名 → 连接定义（不建适配器）。名字区分大小写。
+   *
+   * ⚠ 这里的 `name === undefined` 检查**不是入参校验**（那归 `defineTool`：
+   *   `connection: { required: true }` 已经在 execute 之前拦下了"没传"）。
+   *   它的作用是**类型收窄** —— 签名是 `string | undefined`，收成 `string` 之后
+   *   下面 `cfg.connections?.[name]` 才不用到处写断言。
+   *
+   *   真触发到它，说明有人**绕过 defineTool 直接调这个内部函数**（比如测试），
+   *   所以文案也照旧说得清楚。
+   */
   const resolveConnection = (name: string | undefined): NamedSqlConnection => {
     if (name === undefined) {
       throw new Error('必须显式指定 connection 参数（不再有默认连接）。可用 sql_settings 查看连接清单。')
@@ -279,14 +301,14 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
     }))
   }
 
-  const sqlQuery: SqlToolDefinition = {
+  const sqlQuery = defineTool({
     name: 'sql_query',
     description: '执行只读 SQL 查询（SELECT / PRAGMA / EXPLAIN / SHOW / DESCRIBE / WITH）。一次只能一条语句，会做词法校验拦截写操作。',
-    parameters: compileParameters({
+    parameters: {
       sql: { type: 'string', required: true },
       connection: { type: 'string', required: true, description: '连接名。用 sql_settings 查看可见连接。' },
       format: { type: 'string', description: '输出格式：table（默认表格）/ csv / json。csv 与 json 会额外返回 formatted 文本，便于落盘或转存。' },
-    }),
+    },
     output: {
       schema: querySchema,
       render: (_args, value) => {
@@ -304,8 +326,7 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },
-    async execute(rawArgs: unknown, exec: unknown) {
-      const args = asRecord(rawArgs)
+    async execute(args, exec) {
       const sql = assertReadQuery(requiredString(args, 'sql', 'SQL 语句'))
       const maxRows = requireMaxRows(loadConfig())
       const { adapter, name } = getAdapter(optionalString(args, 'connection'))
@@ -341,15 +362,15 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
       return base
     },
     timeoutMs: QUERY_TIMEOUT_MS,
-  }
+  })
 
-  const sqlExec: SqlToolDefinition = {
+  const sqlExec = defineTool({
     name: 'sql_exec',
     description: '执行写操作或 DDL（INSERT / UPDATE / DELETE / CREATE / ALTER / DROP 等）。一次只能一条语句。受该连接的 readOnly 开关保护，返回影响行数。',
-    parameters: compileParameters({
+    parameters: {
       sql: { type: 'string', required: true },
       connection: { type: 'string', required: true, description: '连接名。用 sql_settings 查看可见连接。' },
-    }),
+    },
     output: {
       schema: execSchema,
       render: (_args, value) => {
@@ -357,8 +378,7 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
         return [{ type: 'text', text: '执行完成（' + rec.connection + '）：影响 ' + rec.changes + ' 行。' }]
       },
     },
-    async execute(rawArgs: unknown, exec: unknown) {
-      const args = asRecord(rawArgs)
+    async execute(args, exec) {
       const sql = requiredString(args, 'sql', 'SQL 语句')
       // 驱动层本就不接受多语句。提前拦下是为了给出「请拆成多次调用」这种能照做的报错，
       // 否则 AI 拿到的是驱动的语法错误，会以为 SQL 本身写错了。
@@ -369,7 +389,7 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
       // 先解析定义并判 readOnly，再建适配器 —— 只读连接不该被建出一个用不上的连接池。
       const connection = resolveConnection(optionalString(args, 'connection'))
       if (isReadOnly(connection)) {
-        throw new Error('连接 ' + connection.name + ' 的 readOnly=true，sql_exec 已被禁用。需要写操作请把该连接的 readOnly 改为 false（用 sql_connection_set，或直接编辑配置文件）。')
+        throw new Error('连接 ' + connection.name + ' 的 readOnly=true，sql_exec 已被禁用。需要写操作请在插件设置页把该连接的 readOnly 改成 false。')
       }
       let changes: number
       try {
@@ -383,15 +403,15 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
       return { connection: connection.name, changes }
     },
     timeoutMs: EXEC_TIMEOUT_MS,
-  }
+  })
 
-  const sqlSchema: SqlToolDefinition = {
+  const sqlSchema = defineTool({
     name: 'sql_schema',
     description: '查看数据库结构：返回表清单，或指定 table 时返回该表的列信息（名称/类型/非空/主键）。',
-    parameters: compileParameters({
+    parameters: {
       table: { type: 'string' },
       connection: { type: 'string', required: true, description: '连接名。用 sql_settings 查看可见连接。' },
-    }),
+    },
     output: {
       schema: schemaToolSchema,
       render: (_args, value) => {
@@ -416,8 +436,7 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
         return [{ type: 'text', text: '共 ' + tables.length + ' 张表：' + tables.join(', ') }]
       },
     },
-    async execute(rawArgs: unknown, exec: unknown) {
-      const args = asRecord(rawArgs)
+    async execute(args, exec) {
       const { adapter, name } = getAdapter(optionalString(args, 'connection'))
       const table = optionalString(args, 'table')
       const signal = executionSignal(exec)
@@ -431,14 +450,14 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
       return { connection: name, tables, columns: [] }
     },
     timeoutMs: 30000,
-  }
+  })
 
-  const sqlStats: SqlToolDefinition = {
+  const sqlStats = defineTool({
     name: 'sql_stats',
     description: '数据库概览统计：表数量、每张表的行数、库体积（SQLite 按页计算，MySQL/PostgreSQL 走系统表）。',
-    parameters: compileParameters({
+    parameters: {
       connection: { type: 'string', required: true, description: '连接名。用 sql_settings 查看可见连接。' },
-    }),
+    },
     output: {
       schema: statsSchema,
       render: (_args, value) => {
@@ -458,8 +477,7 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },
-    async execute(rawArgs: unknown, exec: unknown) {
-      const args = asRecord(rawArgs)
+    async execute(args, exec) {
       const { adapter, name, connection } = getAdapter(optionalString(args, 'connection'))
       const engine = adapter.engine
       const signal = executionSignal(exec)
@@ -512,12 +530,12 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
       return { connection: name, engine, tableCount: tables.length, tables, tablesError, sizeBytes, sizeError }
     },
     timeoutMs: STATS_TIMEOUT_MS,
-  }
+  })
 
-  const sqlHealth: SqlToolDefinition = {
+  const sqlHealth = defineTool({
     name: 'sql_health',
     description: '逐连接做连通性测试（SELECT 1），返回每个连接通不通。只探在 activeEnv 下可见的连接。',
-    parameters: compileParameters({}),
+    parameters: {},
     output: {
       schema: healthSchema,
       render: (_args, value) => {
@@ -525,7 +543,7 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
         const connections = Array.isArray(rec.connections) ? rec.connections : []
         const bad = connections.filter((c) => asRecord(c).ok !== true)
         if (connections.length === 0) {
-          return [{ type: 'text', text: 'dsh-sql 探活：activeEnv 下没有可见的连接。用 sql_settings 看配置、sql_connection_set 添加。' }]
+          return [{ type: 'text', text: 'dsh-sql 探活：activeEnv 下没有可见的连接。用 sql_settings 看配置，在插件设置页添加连接。' }]
         }
         const lines = ['dsh-sql 探活' + (bad.length === 0 ? '：全部连接正常。' : '：' + bad.length + ' / ' + connections.length + ' 个连接异常。')]
         for (const item of connections) {
@@ -535,13 +553,13 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },
-    async execute(_rawArgs: unknown, exec: unknown) {
+    async execute(_args, exec) {
       const connections = await pingAllConnections(executionSignal(exec))
       const bad = connections.filter((c) => c.ok !== true)
       return { ok: bad.length === 0, connections }
     },
     timeoutMs: 30000,
-  }
+  })
 
   return { tools: [sqlQuery, sqlExec, sqlSchema, sqlStats, sqlHealth], adapters }
 }

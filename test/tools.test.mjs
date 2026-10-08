@@ -40,10 +40,22 @@ test('每个工具 schema 是 object JSON Schema', () => {
   }
 })
 
-test('不传 connection 直接报错（不再有默认连接）', async () => {
-  await assert.rejects(() => query.execute({ sql: 'SELECT 1' }), /必须显式指定 connection/)
-  await assert.rejects(() => exec.execute({ sql: 'SELECT 1' }), /必须显式指定 connection/)
-  await assert.rejects(() => schema.execute({}), /必须显式指定 connection/)
+test('不传 connection 由 defineTool 拦下（不再有默认连接）', async () => {
+  // ⚠ 这条从前断言的是 execute 里手写的「必须显式指定 connection」。切到 defineTool 之后，
+  //   `connection: { required: true }` 会在 **execute 之前**被宿主校验拦下，
+  //   报错是 `ToolArgsError: invalid arguments: missing required property "connection"`。
+  //   比手写的更准（指出缺哪个字段），而且**所有工具一致**。
+  const missing = /invalid arguments.*connection/
+  await assert.rejects(() => query.execute({ sql: 'SELECT 1' }), missing)
+  await assert.rejects(() => exec.execute({ sql: 'SELECT 1' }), missing)
+  await assert.rejects(() => schema.execute({}), missing)
+})
+
+test('入参类型不对也由 defineTool 拦下（以前靠各工具自己兜）', async () => {
+  // 切 defineTool 的主要收益：schema 真的生效了。从前手写的 parameters 宿主不校验，
+  // 传错类型只会被 asRecord / optionalString 悄悄吞掉。
+  await assert.rejects(() => query.execute({ sql: 123, connection: 'local' }), /invalid arguments/)
+  await assert.rejects(() => query.execute({ sql: 'SELECT 1', connection: 42 }), /invalid arguments/)
 })
 
 test('sql_exec + sql_query + sql_schema 全链路', async () => {

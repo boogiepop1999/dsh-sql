@@ -1,4 +1,7 @@
-# dsh-sql — 声明挂载；插件没有配置项，一切设置见 $DSH_HOME/sql/settings.json
+# dsh-sql — 声明挂载。
+#
+# 配置**不在这里**：它在当前 profile 的 `cordis.patch.yml` 里 `id: sql` 的 `config` 段，
+# 由设置页表单读写（服务端导出 `Config` schema，浏览器侧是 `lib/client.js`）。
 - insert:
     - id: sql
       name: 'dsh-sql'

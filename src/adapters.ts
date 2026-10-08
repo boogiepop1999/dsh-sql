@@ -455,14 +455,14 @@ export function createAdapter(connection: SqlConnectionConfig): DatabaseAdapter 
   // 这里不兜底成 postgres：把 "oracle" 当成 postgres 去连，报出来的是 DNS 错误，
   // 完全看不出真正原因是引擎名写错了。
   if (connection.engine !== 'sqlite' && connection.engine !== 'mysql' && connection.engine !== 'postgres') {
-    throw new Error('未知引擎 ' + JSON.stringify(connection.engine) + '（可选：sqlite / mysql / postgres）。请用 sql_connection_set 修正。')
+    throw new Error('未知引擎 ' + JSON.stringify(connection.engine) + '（可选：sqlite / mysql / postgres）。请在插件设置页修正。')
   }
-  // 不补默认值：缺字段要么是配置被手改坏了，要么是绕过 sql_connection_set 写入的。
+  // 不补默认值：缺字段要么是配置被手改坏了，要么是绕过设置页写进去的。
   // 报出缺了什么，好过悄悄连到 localhost 或内存库上。
-  // 规则与写入侧共用（missingConnectionFields），这里只负责措辞。
+  // 规则与建连侧共用（missingConnectionFields），这里只负责措辞。
   const missing = missingConnectionFields(connection)
   if (missing.length > 0) {
-    throw new Error('连接配置缺少必填字段：' + missing.join('、') + '。请用 sql_connection_set 补全。')
+    throw new Error('连接配置缺少必填字段：' + missing.join('、') + '。请在插件设置页补全。')
   }
   if (connection.engine === 'sqlite') return new SqliteAdapter(connection.file as string)
   if (connection.engine === 'mysql') return new MysqlAdapter(connection)

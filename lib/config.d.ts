@@ -35,15 +35,56 @@ export interface SqlConnectionConfig {
  * 那份一定带 `connections`（缺失会兜成 `{}`），但 `activeEnv` / `environments` / `maxRows`
  * 仍可能缺席 —— 它们各有各的默认/校验点，见 `isReadOnly` / `requireMaxRows`。
  */
+/**
+ * 一个环境。
+ *
+ * **只有名字** —— 与 dsh-api-call 的 environment 不同，SQL 连接的环境没有 baseUrl
+ * 这类属性（地址在连接自己身上），所以条目里没有别的字段。
+ *
+ * 那为什么不用 `string[]`？因为要跟 api-call 的模型对齐（见 `SqlSettings.environments`），
+ * 而且形状是对象的话，以后要加字段（默认 schema、说明……）不用再改一次形状。
+ */
+export interface SqlEnvironmentConfig {
+    name: string;
+}
 export interface SqlSettings {
     /** 当前环境名；空串 = 未设置。必须在 environments 里。 */
     activeEnv?: string;
-    /** 环境清单（去重、非空字符串）。 */
-    environments?: string[];
+    /**
+     * 环境清单：**随机 id → { name }**。
+     *
+     * 键是**与显示名无关的随机 id**，用户看不到也改不了；业务上引用环境一律用条目的
+     * `name`（`activeEnv` 和 connection 的 `env` 存的都是名字）。
+     *
+     * 与 dsh-api-call 的 `environments` 同构（那边条目还带 baseUrl / allowInsecure）。
+     * 这个形状是为了让设置页能用**深路径 op** 增删改单个环境：
+     *
+     *     { op: "set",   path: ["environments", "a3f2c1", "name"], value: "qa" }
+     *     { op: "set",   path: ["environments", "b7e9d4"], value: { name: "uat" } }
+     *     { op: "unset", path: ["environments", "b7e9d4"] }
+     *
+     * ⚠ **不接受旧的 `string[]` 形状**：数组只能整组替换（`set ["environments"]`），
+     *   而"改一个环境名"用整组替换做就得自己算 diff —— 那是焦点丢失与误删的来源。
+     *   旧配置（0.4.x 及以前）请手工改成新形状，或删掉让插件重新生成。
+     */
+    environments?: Record<string, SqlEnvironmentConfig>;
     /** 连接表：键即连接名（区分大小写）。 */
     connections?: Record<string, SqlConnectionConfig>;
     maxRows?: number;
 }
+/**
+ * 环境清单里的**全部名字**（跳过没有 name 的畸形条目）。
+ *
+ * 顺序是**插入顺序**（JS 对象字符串键的枚举顺序），也就是用户添加的先后 ——
+ * 报告里照这个顺序列，跟设置页看到的顺序一致。
+ */
+export declare function environmentNames(settings: SqlSettings): string[];
+/**
+ * 按**显示名**取出一个环境（键是 id，名字只是条目里的一个字段）。
+ *
+ * 找不到返回 `undefined` —— 调用方自己决定是抛错还是当空处理。
+ */
+export declare function findEnvironmentByName(settings: SqlSettings, name: string): SqlEnvironmentConfig | undefined;
 /**
  * 单次查询超时。**代码常量，不可配置** —— Harness 的 `timeoutMs` 在工具注册时求值一次，
  * 做成配置项就得重启才生效，与「改配置立即生效」冲突，因此定死。
@@ -66,7 +107,7 @@ export declare const EXEC_TIMEOUT_MS = 30000;
 export declare const STATS_TIMEOUT_MS = 120000;
 /** 连接密码环境变量名：DSH_SQL_PASSWORD_<NAME 大写>。 */
 export declare function passwordEnvName(name: string): string;
-/** description 字段最大长度；超长由 sql_connection_set 报错拦下（读取侧不校验也不截断）。 */
+/** description 字段最大长度；超长由设置页的 schema 拦下（读取侧不校验也不截断）。 */
 export declare const DESCRIPTION_MAX_LENGTH = 100;
 /**
  * readOnly 的**生效值**：只有显式 `false` 才可写，其余一律只读。
@@ -126,8 +167,13 @@ export declare function fillConnectionKeys(connection: SqlConnectionConfig): Sql
 /**
  * 列出连接缺少的必填字段（空数组 = 齐了）。
  *
- * **写入侧（`sql_connection_set`）与建连侧（`createAdapter`）共用这一份规则** ——
- * 两处各写一遍必然漂移（曾经就出现过报错顺序不一致）。措辞由调用方拼，规则只此一处。
+ * **建连侧（`createAdapter`）用这一份规则** —— 从前写入侧（已删除的 `sql_connection_set`）
+ * 也用它，两处各写一遍必然漂移（曾经就出现过报错顺序不一致）。措辞由调用方拼，规则只此一处。
+ *
+ * ⚠ **它管不了"保存时"**：条件是随 engine 变的（sqlite 要 file、mysql/pg 要 host+port、
+ *   pg 还要 database），而 schemastery 的 schema 只能表达**单字段**的约束，
+ *   表达不了"这个字段在那种情况下必填"。所以这一层只能在**建连时**判 ——
+ *   报错会说清缺了哪几个字段，好过悄悄连到 localhost 或内存库上。
  *
  * 不查 `user` / `password`：有的库确实不要密码。也不查 mysql 的 `database`：
  * 不指定默认库时可用全限定名查询。

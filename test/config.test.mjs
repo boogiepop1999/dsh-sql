@@ -24,13 +24,13 @@ import {
 test('normalizeSettings：只查顶层形状 + 剔未知字段', () => {
   const out = normalizeSettings({
     activeEnv: 'qa',
-    environments: ['qa'],
+    environments: { e1: { name: 'qa' } },
     connections: { a: { engine: 'sqlite', file: ':memory:' } },
     maxRows: 500,
     unknownTop: '丢掉',
   })
   assert.equal(out.activeEnv, 'qa')
-  assert.deepEqual(out.environments, ['qa'])
+  assert.deepEqual(out.environments, { e1: { name: 'qa' } }, '环境字典原样读出（键是 id）')
   assert.equal(out.maxRows, 500)
   assert.equal(out.unknownTop, undefined, '未知顶层字段被剔除')
   // 连接内部的字段**一概不动** —— 没有 trim、没有类型过滤、不补默认值
@@ -43,12 +43,21 @@ test('normalizeSettings：connections 缺失兜底成空对象', () => {
   assert.deepEqual(normalizeSettings({ activeEnv: 'qa' }).connections, {})
 })
 
-test('normalizeSettings：顶层不是对象 / connections 不是对象都报错', () => {
+test('normalizeSettings：顶层不是对象 / connections 不是对象 / environments 是旧形状都报错', () => {
   assert.throws(() => normalizeSettings(null), /顶层必须是一个对象/)
   assert.throws(() => normalizeSettings([]), /顶层必须是一个对象/)
   assert.throws(() => normalizeSettings('x'), /顶层必须是一个对象/)
   assert.throws(() => normalizeSettings({ connections: [] }), /connections 必须是一个对象/)
-  assert.throws(() => normalizeSettings({ environments: 'nope' }), /environments 必须是一个数组/)
+  assert.throws(() => normalizeSettings({ environments: 'nope' }), /environments 必须是「id → \{ name \}」的对象/)
+})
+
+test('normalizeSettings：0.4.x 的 string[] 形状被明确拒绝，并指出是旧格式', () => {
+  // 不做静默转换：id 是随机生成的，转一份出来用户下次打开设置页会看到一堆不认识的键。
+  // 报错要说清"这是旧形状、该去哪儿重配"，否则只看到"格式不对"会一头雾水。
+  assert.throws(
+    () => normalizeSettings({ environments: ['qa', 'prod'] }),
+    /这是 0\.4\.x 的旧形状/,
+  )
 })
 
 test('normalizeSettings：不做归一化（无 trim、无默认值、不校验）', () => {
@@ -110,8 +119,8 @@ test('requireMaxRows：缺省 1000；非法直接报错（不静默夹取）', (
   assert.throws(() => requireMaxRows({ maxRows: 1.5 }), /1~10000 之间的整数/)
   assert.throws(() => requireMaxRows({ maxRows: '500' }), /1~10000 之间的整数/)
   assert.throws(() => requireMaxRows({ maxRows: true }), /1~10000 之间的整数/)
-  // 报错要指明怎么改
-  assert.throws(() => requireMaxRows({ maxRows: 999999 }), /sql_config_set/)
+  // 报错要指明怎么改 —— 配置编辑现在统一在插件设置页
+  assert.throws(() => requireMaxRows({ maxRows: 999999 }), /插件设置页/)
 })
 
 test('超时是代码常量，不进设置文件也不被解析', () => {
@@ -182,7 +191,7 @@ test('passwordEnvName：连接名 → 环境变量名', () => {
 test('splitConnectionsByEnv：当前环境的 + 未标环境的可用，其它环境排除', () => {
   const { available, excluded } = splitConnectionsByEnv({
     activeEnv: 'qa',
-    environments: ['qa', 'pro'],
+    environments: { e1: { name: 'qa' }, e2: { name: 'pro' } },
     connections: {
       'qa-db': { engine: 'sqlite', env: 'qa' },
       'pro-db': { engine: 'sqlite', env: 'pro' },
@@ -196,7 +205,7 @@ test('splitConnectionsByEnv：当前环境的 + 未标环境的可用，其它�
 
 test('splitConnectionsByEnv：activeEnv 为空时只有不限环境的可用', () => {
   const { available, excluded } = splitConnectionsByEnv({
-    environments: ['qa', 'pro'],
+    environments: { e1: { name: 'qa' }, e2: { name: 'pro' } },
     connections: {
       'qa-db': { engine: 'sqlite', env: 'qa' },
       'pro-db': { engine: 'sqlite', env: 'pro' },
@@ -208,7 +217,7 @@ test('splitConnectionsByEnv：activeEnv 为空时只有不限环境的可用', (
 })
 
 test('splitConnectionsByEnv：环境名区分大小写；activeEnv 会 trim', () => {
-  const environments = ['qa']
+  const environments = { e1: { name: 'qa' } }
   const upper = splitConnectionsByEnv({
     activeEnv: 'QA',
     environments,
@@ -230,7 +239,7 @@ test('splitConnectionsByEnv：env 指向不存在的环境时，两组都不进'
   // 以为"还能用"，实际在任何环境下都不会出现。这种情况交给 sql_settings 的问题节点名。
   const { available, excluded } = splitConnectionsByEnv({
     activeEnv: 'qa',
-    environments: ['qa', 'prod'],
+    environments: { e1: { name: 'qa' }, e2: { name: 'prod' } },
     connections: {
       'in-qa': { engine: 'sqlite', env: 'qa' },
       'in-prod': { engine: 'sqlite', env: 'prod' },
