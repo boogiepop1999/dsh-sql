@@ -795,10 +795,21 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // ⚠ **顺序要紧，且与 dsh-api-call 一致**：
+      //
+      //     ① syncDrafts()        —— 先把草稿建起来
+      //     ② form.bind(project)  —— `bind` 会**立即调一次** `project()`
+      //     ③ scope.subscribe(…)  —— 宿主配置变了再重建
+      //
+      //   把 `syncDrafts()` 放到 `bind` 之后是错的：scope 已就绪时，`bind` 那一刻
+      //   草稿还是 `null`，`project()` 里的 `envDraft ?? {}` 就把**空字典**投了出去。
+      //   而 `syncDrafts()` 只赋值、**不刷新 store** —— 那个空投影会一直挂着，
+      //   直到下一次 `refresh()`（编辑或宿主推送）才恢复。表现就是"环境和连接两节
+      //   明明是配好的，却显示空"。
+      syncDrafts()
+
       const store = form.bind(project)
       const refresh = () => store.set(project())
-
-      syncDrafts()
 
       const unsubscribeScope = scope.subscribe(() => { syncDrafts(); refresh() })
 
@@ -958,8 +969,11 @@ window.__ModuleLoader__.load({
                   key: PACKAGE_NAME,
                   locale: NS,
                   inject: () => ({
+                    // ⚠ 只给 `hooks` 与动作，**不给 `useConfigCard`** ——
+                    //   它由插槽框架通过 `props` 提供（卡片里用的是 `props.useConfigCard`）。
+                    //   自己再塞一份是同名重复：框架那份优先，行为又一致，纯属噪声。
+                    //   与 dsh-api-call 的 `inject()` 保持同构。
                     hooks: { configCard: store },
-                    useConfigCard: (sel: (s: any) => unknown) => sel(store.getSnapshot()),
                     ...actions,
                   }),
                 },

@@ -147,7 +147,15 @@ const VALUE = {
   },
 }
 
-function harness({ ready = true, writable = true, value = VALUE } = {}) {
+/**
+ * @param opts.ready      scope 是否就绪
+ * @param opts.writable   配置是否可写
+ * @param opts.value      宿主值
+ * @param opts.subscribeEager  真实的 `scope.subscribe(fn)` 会**同步立即回调一次**。
+ *   默认 true（照真实行为）。置 false 可模拟"订阅后宿主**不再推送**"——
+ *   用来看代码是否**只靠自己**就把草稿建起来了，而不是搭订阅那次回调的便车。
+ */
+function harness({ ready = true, writable = true, value = VALUE, subscribeEager = true } = {}) {
   let captured = null
   new Function('window', SRC)({ __ModuleLoader__: { load: (o) => { captured = o } } })
   const mod = captured.factory((name) => (name === 'react' ? reactStub : primitivesStub()))
@@ -157,7 +165,10 @@ function harness({ ready = true, writable = true, value = VALUE } = {}) {
     getSnapshot: () => (ready
       ? { status: 'ready', writable, revision: 7, value }
       : { status: 'loading', writable: false, revision: undefined, value: undefined }),
-    subscribe: (fn) => { fn(); return () => {} },
+    subscribe: (fn) => {
+      if (subscribeEager) fn()
+      return () => {}
+    },
     /**
      * 真实的 `mutate(ops, revision)` **带 revision 栅栏**：传了旧 revision 会被拒
      * （返回 false），宿主就是这么防"读-改-写"撞车的。替身必须同样对待 ——
@@ -238,13 +249,30 @@ test('scope 未就绪时 apply 不抛错（否则整个配置表单消失）', (
 
 // ── 渲染 ───────────────────────────────────────────────────────────────────
 
+/**
+ * 按**框架的方式**拼出卡片要的 props。
+ *
+ * ⚠ `useConfigCard` 是**插槽框架**通过 `props` 给的，**不是**插件 `inject()` 给的
+ *   （对比 dsh-api-call：它的 `inject()` 里没有这一项，而卡片照样在用）。
+ *   所以测试必须自己模拟框架把它放进 props —— 直接从 `face` 里摊是拿不到的。
+ *
+ * `t` 用恒等函数：这样断言里看到的就是 i18n 的 **key**，改文案不会碰测试。
+ */
+function cardProps(face) {
+  return {
+    t: (k) => k,
+    useConfigCard: (sel) => sel(face.hooks.configCard.getSnapshot()),
+    ...face,
+  }
+}
+
 test('深度渲染整棵树不抛错（三种引擎都覆盖）', () => {
   const h = harness()
   h.mod.apply(h.ctx)
   const face = h.registration.o.inject()
   const counter = { n: 0 }
   assert.doesNotThrow(
-    () => deep(h.registration.component({ t: (k) => k, ...face }), face, 0, counter),
+    () => deep(h.registration.component(cardProps(face)), face, 0, counter),
     '只断言 props 形状等于没测 —— 组件读一个没传的 prop 就会让整棵子树被卸载',
   )
   assert.ok(counter.n >= 4, `至少要真的调用到主卡片与各连接卡片，实际 ${counter.n}`)
@@ -254,7 +282,7 @@ test('渲染出的值覆盖三种引擎各自的字段', () => {
   const h = harness()
   h.mod.apply(h.ctx)
   const face = h.registration.o.inject()
-  const nodes = collect(deep(h.registration.component({ t: (k) => k, ...face }), face))
+  const nodes = collect(deep(h.registration.component(cardProps(face)), face))
   const values = nodes.map((n) => n.props.value).filter((v) => v !== undefined)
 
   assert.ok(values.includes('qa') && values.includes('prod'), '环境名')
@@ -274,6 +302,29 @@ test('初始草稿来自宿主值', () => {
   assert.deepEqual(Object.keys(snap.envDraft), ['e1', 'e2'])
   assert.deepEqual(Object.keys(snap.connDraft), ['c1', 'c2', 'c3'], '草稿的键是随机 id，不是连接名')
   assert.equal(snap.dirty, false, '什么都没改')
+})
+
+/**
+ * 初始化顺序：`syncDrafts()` 必须在 `form.bind(project)` **之前**。
+ *
+ * `bind` 会**立即调一次** `project()`，而 `project()` 里是 `envDraft ?? {}` ——
+ * 草稿还没建的话它就把**空字典**投了出去；而 `syncDrafts()` 只赋值、不刷新 store，
+ * 那个空投影会一直挂着。表现就是"环境和连接明明配好了，设置页却显示空"。
+ *
+ * ⚠ 这条测试必须用 `subscribeEager: false`：真实宿主订阅后会同步回调一次，
+ *   而那次回调会调 `syncDrafts()` —— 它会**替顺序错误兜底**，于是顺序写反了也测不出来。
+ *   关掉那次回调，才能验出"代码是不是只靠自己就把草稿建对了"。
+ */
+test('回归：syncDrafts 在 bind 之前 —— 首次投影就该带上草稿', () => {
+  const h = harness({ subscribeEager: false })
+  h.mod.apply(h.ctx)
+
+  // 不看 `face.xxx()`，直接读 `bind` 的**首次投影**（store 的初始快照）
+  const snap = h.registration.o.inject().hooks.configCard.getSnapshot()
+  assert.deepEqual(Object.keys(snap.connDraft), ['c1', 'c2', 'c3'],
+    'bind 的首次投影就该有连接草稿 —— 没有说明 syncDrafts 跑到 bind 后面去了')
+  assert.deepEqual(Object.keys(snap.envDraft), ['e1', 'e2'],
+    'bind 的首次投影就该有环境草稿')
 })
 
 // ── 回归：编辑不得自动落盘、外壳必须是官方的 ───────────────────────────────
@@ -318,7 +369,7 @@ test('回归：外壳用官方 SettingsForm（自带保存/丢弃按钮与 dirty
   const h = harness()
   h.mod.apply(h.ctx)
   const face = h.registration.o.inject()
-  const nodes = collect(deep(h.registration.component({ t: (k) => k, ...face }), face))
+  const nodes = collect(deep(h.registration.component(cardProps(face)), face))
 
   const shell = nodes.find((n) => n.type === 'SettingsForm')
   assert.ok(shell, '必须用官方 SettingsForm 当外壳 —— 自绘的裸 button 没有 dirty 语义')
