@@ -64,10 +64,11 @@ const VALUE = {
   activeEnv: 'qa',
   maxRows: 1000,
   environments: { e1: { name: 'qa' }, e2: { name: 'prod' } },
+  // 键是**随机 id**，名字在条目的 `name` 上（跟环境同构）。改名只改 name 字段。
   connections: {
-    polar: { engine: 'sqlite', file: ':memory:', env: 'qa', readOnly: true, description: '本地' },
-    gp: { engine: 'postgres', host: '10.0.0.2', port: 5432, user: 'ro', database: 'cg', env: 'prod', readOnly: true },
-    my: { engine: 'mysql', host: '10.0.0.1', port: 3306, user: 'ro', database: 'app', env: 'qa', readOnly: false },
+    c1: { name: 'polar', engine: 'sqlite', file: ':memory:', env: 'qa', readOnly: true, description: '本地' },
+    c2: { name: 'gp', engine: 'postgres', host: '10.0.0.2', port: 5432, user: 'ro', database: 'cg', env: 'prod', readOnly: true },
+    c3: { name: 'my', engine: 'mysql', host: '10.0.0.1', port: 3306, user: 'ro', database: 'app', env: 'qa', readOnly: false },
   },
 }
 
@@ -184,7 +185,7 @@ test('初始草稿来自宿主值', () => {
   h.mod.apply(h.ctx)
   const snap = h.registration.o.inject().hooks.configCard.getSnapshot()
   assert.deepEqual(Object.keys(snap.envDraft), ['e1', 'e2'])
-  assert.deepEqual(Object.keys(snap.connDraft), ['polar', 'gp', 'my'])
+  assert.deepEqual(Object.keys(snap.connDraft), ['c1', 'c2', 'c3'], '草稿的键是随机 id，不是连接名')
   assert.equal(snap.dirty, false, '什么都没改')
 })
 
@@ -194,8 +195,8 @@ test('保存：改环境名 / 连接字段 / 密码都发成深路径 op', async
   const face = h.registration.o.inject()
 
   face.editEnv('e2', 'name', 'production')
-  face.editConn('gp', 'host', '10.0.0.9')
-  face.editConn('gp', 'password', 'SECRET')
+  face.editConn('c2', 'host', '10.0.0.9')
+  face.editConn('c2', 'password', 'SECRET')
   face.save()
   await new Promise((r) => setTimeout(r, 5))
 
@@ -205,12 +206,12 @@ test('保存：改环境名 / 连接字段 / 密码都发成深路径 op', async
     { op: 'set', path: ['environments', 'e2', 'name'], value: 'production' },
   )
   assert.deepEqual(
-    ops.find((o) => o.path[1] === 'gp' && o.path[2] === 'host'),
-    { op: 'set', path: ['connections', 'gp', 'host'], value: '10.0.0.9' },
+    ops.find((o) => o.path[1] === 'c2' && o.path[2] === 'host'),
+    { op: 'set', path: ['connections', 'c2', 'host'], value: '10.0.0.9' },
   )
   assert.deepEqual(
-    ops.find((o) => o.path[1] === 'gp' && o.path[2] === 'password'),
-    { op: 'set', path: ['connections', 'gp', 'password'], value: 'SECRET' },
+    ops.find((o) => o.path[1] === 'c2' && o.path[2] === 'password'),
+    { op: 'set', path: ['connections', 'c2', 'password'], value: 'SECRET' },
   )
   assert.equal(h.mutations[0].rev, 7, '带 revision 栅栏')
 })
@@ -219,7 +220,7 @@ test('保存：没动过的连接字段不发 op（尤其是 password）', async
   const h = harness()
   h.mod.apply(h.ctx)
   const face = h.registration.o.inject()
-  face.editConn('gp', 'host', '10.0.0.9')
+  face.editConn('c2', 'host', '10.0.0.9')
   face.save()
   await new Promise((r) => setTimeout(r, 5))
 
@@ -227,19 +228,52 @@ test('保存：没动过的连接字段不发 op（尤其是 password）', async
   assert.equal(paths.some((p) => p.includes('password')), false, '没动密码就不能写它 —— 整组写回会把它抹掉')
 })
 
-test('保存：改名连接 = 原子地删旧键 + 加新键', async () => {
+test('保存：改名连接只改 name 字段，**不动键**（否则密码会被清空）', async () => {
+  // 键是随机 id，名字是条目里的字段 —— 所以改名走深路径 `["connections", id, "name"]`。
+  //
+  // ⚠ 这条是**防回归**的关键：若改回"键即名字"，改名就只能删旧键 + 加新键，而新键
+  //   走"新增整条" —— 浏览器拿不到已存的密码（宿主脱敏），那条 op 里的 password
+  //   只能是空串，于是**改一次名就把密码清空**。
   const h = harness()
   h.mod.apply(h.ctx)
   const face = h.registration.o.inject()
-  face.renameConn('polar', 'local')
+  face.editConn('c1', 'name', 'local')
   face.save()
   await new Promise((r) => setTimeout(r, 5))
 
   const ops = h.mutations[0]?.ops ?? []
-  assert.deepEqual(ops.find((o) => o.op === 'unset'), { op: 'unset', path: ['connections', 'polar'] })
-  const added = ops.find((o) => o.op === 'set' && o.path.length === 2)
-  assert.equal(added.path[1], 'local', '新键用了新名字')
-  assert.equal(added.value.engine, 'sqlite', '定义原样带过去')
+  assert.deepEqual(ops, [{ op: 'set', path: ['connections', 'c1', 'name'], value: 'local' }],
+    '只发一条改名字段的 op：没有 unset、没有"新增整条"')
+  assert.equal(ops.some((o) => o.op === 'unset'), false, '键不该被删')
+  assert.equal(ops.some((o) => o.path.length === 2), false, '不该整条重写 —— 那会把 password 冲成空串')
+})
+
+test('保存：port 填了非数字不写 NaN/null，当作"没设"', async () => {
+  // port 输入框是 `type="text"`（只是唤数字键盘，不做前端校验），所以用户能填进字母。
+  // 若原样 `Number()` 存进草稿，`JSON.stringify({port:NaN})` 会写成 `null` ——
+  // schema 的 `z.number()` 收下它，配置里就静默多一个 `port: null`，连库时才报错。
+  const h = harness()
+  h.mod.apply(h.ctx)
+  const face = h.registration.o.inject()
+
+  face.editConn('c3', 'port', 'abc')
+  face.save()
+  await new Promise((r) => setTimeout(r, 5))
+
+  const ops = h.mutations[0]?.ops ?? []
+  const portOp = ops.find((o) => o.path[1] === 'c3' && o.path[2] === 'port')
+  assert.ok(portOp, 'port 变了就该发 op')
+  assert.equal(portOp.value, undefined, '非法输入当作"没设"，不能是 NaN / null')
+
+  // 合法数字照常转
+  const h2 = harness()
+  h2.mod.apply(h2.ctx)
+  const face2 = h2.registration.o.inject()
+  face2.editConn('c3', 'port', '1234')
+  face2.save()
+  await new Promise((r) => setTimeout(r, 5))
+  const portOp2 = (h2.mutations[0]?.ops ?? []).find((o) => o.path[1] === 'c3' && o.path[2] === 'port')
+  assert.equal(portOp2.value, 1234)
 })
 
 test('保存：什么都没改就不写入', async () => {
@@ -265,14 +299,16 @@ test('新增/删除条目', () => {
   face.addConn()
   const withNewConn = face.hooks.configCard.getSnapshot().connDraft
   assert.equal(Object.keys(withNewConn).length, 4, '新连接的键不能跟已有的撞')
-  assert.equal(withNewConn.main?.engine, 'sqlite', '新连接默认 sqlite')
+  const newId = Object.keys(withNewConn).find((k) => !['c1', 'c2', 'c3'].includes(k))
+  assert.equal(withNewConn[newId]?.engine, 'sqlite', '新连接默认 sqlite')
+  assert.equal(typeof withNewConn[newId]?.name, 'string', '新连接要有名字（键是 id）')
 
   // 删除：只删指定的那个
   face.removeEnv('e1')
-  face.removeConn('gp')
+  face.removeConn('c2')
   const snap = face.hooks.configCard.getSnapshot()
   assert.equal(snap.envDraft.e1, undefined, 'e1 被删掉')
   assert.equal(snap.envDraft.e2?.name, 'prod', 'e2 原样保留')
-  assert.equal(snap.connDraft.gp, undefined, 'gp 被删掉')
-  assert.deepEqual(Object.keys(snap.connDraft).sort(), ['main', 'my', 'polar'])
+  assert.equal(snap.connDraft.c2, undefined, 'c2 被删掉')
+  assert.deepEqual(Object.keys(snap.connDraft).sort(), [newId, 'c1', 'c3'].sort())
 })

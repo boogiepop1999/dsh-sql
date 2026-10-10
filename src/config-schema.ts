@@ -1,7 +1,7 @@
 /**
  * 运行时配置的 **Schemastery schema** —— 插件设置页的**唯一真源**。
  *
- * 与 `lib/config.js` 的 `SqlSettings` 是**同一份形状的两种表达**：
+ * 与 `src/config.ts` 的 `SqlSettings` 是**同一份形状的两种表达**：
  *
  *   - `SqlSettings`（TS 接口）—— 给编译器和读代码的人看
  *   - 这里（运行时 schema）—— 给 `dsh-settings` 看：它投影成表单、做保存时的校验
@@ -17,7 +17,7 @@
  *
  * **② 跨字段（`config.ts`）** —— schema 表达不了的，比如 `activeEnv` 必须命中
  *   `environments` 里某个条目的 `name`。这类"引用完整性"要看着整份配置才能判，
- *   只能在运行时查（`splitConnectionsByEnv` 会按它切分连接），报错在
+ *   只能在运行时查（`splitConnectionsByEnv` 按它挑出可用连接），报错在
  *   `sql_settings` 的「⚠ 问题」节里列出来。
  *
  * **③ 运行时事实** —— `requireMaxRows`（范围）与 `isReadOnly`（fail-safe 判只读）：
@@ -96,6 +96,7 @@ export const EnvironmentSchema = z.object({
  *   留在 `missingConnectionFields`（建连时判）。
  */
 export const ConnectionSchema = z.object({
+  name: z.string().required().description('连接名，如 polar / gp-qa（工具调用的 connection 参数认它）'),
   engine: z.string().required().description('sqlite / mysql / postgres'),
   file: z.string().default('').description('SQLite 数据库文件路径（engine=sqlite 时必填）'),
   host: z.string().default('').description('主机名（engine=mysql / postgres 时必填）'),
@@ -107,13 +108,13 @@ export const ConnectionSchema = z.object({
   database: z.string().default('').description('数据库名（engine=postgres 时必填）'),
   readOnly: z.boolean().default(true).description('禁止写操作；缺省按只读处理'),
   env: z.string().default('').description('限定环境名；留空表示任何环境都能用'),
-  description: z.string().default('').description('这个连接干什么用的（最长 100 字符）'),
+  description: z.string().max(100).default('').description('这个连接干什么用的（最长 100 字符）'),
 })
 
 /**
  * 全部运行时配置。**schema 是校验的唯一真源。**
  *
- * 字段与 `lib/config.js` 的 `SqlSettings` 一一对应。
+ * 字段与 `src/config.ts` 的 `SqlSettings` 一一对应。
  */
 export const ConfigSchema: Schema = z.object({
   activeEnv: z.string().default('').description('当前环境名（environments 里某个条目的 name）'),
@@ -129,8 +130,8 @@ export const ConfigSchema: Schema = z.object({
  * schema 里表达的默认值快照 —— **仅供测试对照**，运行时不读它。
  *
  * 存在的意义是让 `config.ts` 的 `defaultSettings()` 与 schema 漂移时能被测出来：
- * 两边都是"配置的默认值"，一处改了另一处忘改，症状是"文件不存在时的首次运行"
- * 与"设置页重置"给出不同结果。
+ * 两边都是"配置的默认值"，一处改了另一处忘改，症状是**首次运行**（配置里还没有这个
+ * 字段）与**设置页重置**给出不同结果。
  */
 export const SQL_CONFIG_DEFAULTS = {
   activeEnv: '',

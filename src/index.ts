@@ -55,8 +55,6 @@ export interface SqlSettingsContext extends SqlPluginContext {
  *
  * ⚠ 也不能写空节点（`items: {}` 这种）—— 宿主会 `assertSupportedJsonSchema` 拦下。
  *   "任意值"要写作者侧的 `{ type: 'json' }`。
- *
- * 这两条都是**切到 defineTool 之后才发现的**：从前手写的 `output.schema` 宿主根本不校验。
  */
 const TEXT_OUTPUT: ToolOutput<{ report: string }> = {
   schema: {

@@ -257,12 +257,21 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** 生成一个与现有**连接名**不冲突的名字（连接的键就是名字）。 */
-    function uniqueKey(dict: Record<string, unknown>, base: string): string {
-      if (!Object.prototype.hasOwnProperty.call(dict ?? {}, base)) return base
+    /**
+     * 生成一个与现有**连接名**不冲突的名字。
+     *
+     * ⚠ 查重看的是每个条目的 `name` 字段，**不是 `Object.keys`** —— 键是随机 id，
+     *   跟显示名无关（与环境那边同一套形状）。
+     */
+    function uniqueConnName(dict: Record<string, any>, base: string): string {
+      const taken: Record<string, boolean> = {}
+      for (const entry of Object.values(dict ?? {})) {
+        if (entry && typeof entry.name === 'string') taken[entry.name] = true
+      }
+      if (!taken[base]) return base
       for (let n = 2; ; n++) {
         const candidate = base + n
-        if (!Object.prototype.hasOwnProperty.call(dict ?? {}, candidate)) return candidate
+        if (!taken[candidate]) return candidate
       }
     }
 
@@ -321,8 +330,10 @@ window.__ModuleLoader__.load({
      */
     function ConnectionCard(props: any) {
       const t = props.t
-      const name = props.name
       const def = props.def ?? {}
+      // 名字是**条目里的字段**（键是随机 id）—— 跟环境一样，改名只改字段，
+      // 不动键，所以密码不会被"新增整条"清空（见下 onRename 的说明）。
+      const name = typeof def.name === 'string' ? def.name : ''
       const disabled = props.disabled
       const engine = typeof def.engine === 'string' && def.engine !== '' ? def.engine : 'sqlite'
 
@@ -348,7 +359,9 @@ window.__ModuleLoader__.load({
         fields.push(text('file', 'connFile', t('connFilePlaceholder')))
       } else {
         fields.push(text('host', 'connHost'))
-        // port 是数字：用 numberField 让"填了字母"能被标红，而不是悄悄存成字符串
+        // port 是数字：用 `inputMode="numeric"` 唤出数字键盘，**不做前端校验** ——
+        // 填了字母就在提交时被 `Number()` 判成 `undefined`（= 不设），
+        // 由建连侧的 `missingConnectionFields` 统一报"缺少 port"（见 editConn 的说明）。
         fields.push(
           react.createElement(
             'label',
@@ -397,8 +410,9 @@ window.__ModuleLoader__.load({
             disabled,
             placeholder: t('connNamePlaceholder'),
             'aria-label': t('connName'),
-            // 改名走 onRename（删旧键 + 加新键），不是改字段
-            onChange: (e: any) => props.onRename(e.target.value),
+            // 改名 = 改 `name` 字段（深路径 op）—— 键是随机 id，不动，所以
+            // 同级的 `password` 原样留在宿主里（浏览器本来就拿不到它）。
+            onChange: (e: any) => props.onEdit('name', e.target.value),
           }),
           react.createElement(
             'label',
@@ -531,17 +545,15 @@ window.__ModuleLoader__.load({
             Object.keys(state.connDraft).length === 0
               ? react.createElement('p', { style: EMPTY_STYLE }, t('emptyConns'))
               : null,
-            Object.keys(state.connDraft).map((name) =>
+            Object.keys(state.connDraft).map((id) =>
               react.createElement(ConnectionCard, {
-                key: name,
+                key: id,
                 t,
-                name,
-                def: state.connDraft[name],
-                passwordDraft: state.passwordDraft[name] ?? '',
+                def: state.connDraft[id],
+                passwordDraft: state.passwordDraft[id] ?? '',
                 disabled,
-                onEdit: (key: string, value: unknown) => props.editConn(name, key, value),
-                onRename: (next: string) => props.renameConn(name, next),
-                onRemove: () => props.removeConn(name),
+                onEdit: (key: string, value: unknown) => props.editConn(id, key, value),
+                onRemove: () => props.removeConn(id),
               }),
             ),
             react.createElement('button', { type: 'button', style: BTN, disabled, onClick: props.addConn }, t('addConn')),
@@ -582,10 +594,9 @@ window.__ModuleLoader__.load({
         primitives.settingsNumberField('maxRows'),
       ])
 
-      const listeners = new Set<() => void>()
       let envDraft: Record<string, any> | null = null
       let connDraft: Record<string, any> | null = null
-      /** 连接密码草稿：`连接名 -> 明文`。空串 = 不改动已存的那个。 */
+      /** 连接密码草稿：`条目 id -> 明文`。空串 = 不改动已存的那个。 */
       let passwordDraft: Record<string, string> = {}
       /** 宿主原值快照 —— 用来判断草稿有没有变。 */
       let baseline = { environments: {} as Record<string, any>, connections: {} as Record<string, any> }
@@ -662,8 +673,10 @@ window.__ModuleLoader__.load({
           const next = draft[key]
           const prev = Object.prototype.hasOwnProperty.call(base, key) ? base[key] : undefined
           if (prev === undefined) {
-            // 新增整条。显式带 `password: ''` 是刻意的：新条目本来就没密码。
-            ops.push({ op: 'set', path: [field, key], value: { password: '', ...next } })
+            // 新增整条。连接要显式带 `password: ''`（新连接本来就没密码，让 schema 的
+            // 默认值明确落地）；**环境没有密码字段**，别给它塞。
+            const seed = field === 'connections' ? { password: '', ...next } : next
+            ops.push({ op: 'set', path: [field, key], value: seed })
             continue
           }
           for (const k of Object.keys(next)) {
@@ -733,53 +746,50 @@ window.__ModuleLoader__.load({
 
         addConn: () => {
           const cur = { ...(connDraft ?? {}) }
-          const name = uniqueKey(cur, 'main')
-          cur[name] = { engine: 'sqlite', file: '', port: undefined, user: '', database: '', env: '', readOnly: true, description: '' }
+          const id = newId()
+          // `name` 才是业务名（键是随机 id）。默认名避开已有的那些。
+          cur[id] = {
+            name: uniqueConnName(cur, 'main'),
+            engine: 'sqlite', file: '', port: undefined, user: '',
+            database: '', env: '', readOnly: true, description: '',
+          }
           connDraft = cur
           refresh()
         },
-        removeConn: (name: string) => {
-          if (!connDraft?.[name]) return
+        removeConn: (id: string) => {
+          if (!connDraft?.[id]) return
           const next = { ...connDraft }
-          delete next[name]
+          delete next[id]
           connDraft = next
-          if (passwordDraft[name] !== undefined) {
+          if (passwordDraft[id] !== undefined) {
             const kept = { ...passwordDraft }
-            delete kept[name]
+            delete kept[id]
             passwordDraft = kept
           }
           refresh()
         },
-        editConn: (name: string, key: string, value: unknown) => {
-          if (!connDraft?.[name]) return
+        editConn: (id: string, key: string, value: unknown) => {
+          if (!connDraft?.[id]) return
           if (key === 'password') {
-            passwordDraft = { ...passwordDraft, [name]: String(value) }
+            passwordDraft = { ...passwordDraft, [id]: String(value) }
             refresh()
             return
           }
-          // port 从输入框来的是字符串，转成数字（空串 = 不设，留 undefined）
+          // port 从输入框来的是字符串，转成数字。
+          //
+          // ⚠ 空串与"转不出数字"都留 `undefined`（= 不设），**不能存 NaN**：
+          //   `Number('abc')` 是 NaN，而 `JSON.stringify({port:NaN})` 会写成 `null`
+          //   —— schema 的 `z.number()` 收下 `null`，于是配置里静默多出一个 `port: null`，
+          //   连库时才以"端口不对"的形式暴露，离原因很远。
+          //   留 undefined 的话，`missingConnectionFields` 会明确报"缺少 port"。
           let v: unknown = value
-          if (key === 'port') v = value === '' ? undefined : Number(value)
+          if (key === 'port') {
+            const n = value === '' ? NaN : Number(value)
+            v = Number.isFinite(n) ? n : undefined
+          }
           const next = { ...connDraft }
-          next[name] = { ...next[name], [key]: v }
+          next[id] = { ...next[id], [key]: v }
           connDraft = next
-          refresh()
-        },
-        /** 改名 = 删旧键 + 加新键，**在同一个草稿里**做，保存时原子提交。 */
-        renameConn: (from: string, to: string) => {
-          if (!connDraft?.[from] || from === to) return
-          const next: Record<string, any> = {}
-          for (const k of Object.keys(connDraft)) {
-            if (k === from) next[to] = connDraft[k]
-            else if (k !== to) next[k] = connDraft[k]
-          }
-          connDraft = next
-          if (passwordDraft[from] !== undefined) {
-            const kept = { ...passwordDraft }
-            kept[to] = kept[from]
-            delete kept[from]
-            passwordDraft = kept
-          }
           refresh()
         },
       }
@@ -809,7 +819,6 @@ window.__ModuleLoader__.load({
       ctx.effect(
         () => () => {
           unsubscribeScope()
-          listeners.clear()
           form.dispose()
         },
         'dsh-sql: settings form subscription',

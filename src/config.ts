@@ -1,5 +1,8 @@
 /**
- * dsh-sql 设置解析与校验：类型即 `$DSH_HOME/sql/settings.json` 的形状。
+ * dsh-sql 配置的类型、形状约束与跨字段规则。
+ *
+ * 值由宿主的 settings 服务托管（profile 的 `cordis.patch.yml`），本模块只描述
+ * **它长什么样、哪些组合不合法**，不含 I/O。
  *
  * @module dsh-sql/config
  */
@@ -7,9 +10,17 @@
 /**
  * 单个数据库连接的参数。
  *
- * **不含 name** —— 名字是 connections 字典的键（见 `SqlSettings`）。
+ * `name` 是**显示名 / 业务名** —— 工具调用的 `connection` 参数与设置页里看到的就是它。
+ * 条目在 `connections` 字典里的**键是随机 id**（见 `SqlSettings`），与名字无关。
+ *
+ * ⚠ 键不能直接用名字。连接改名当时用"删旧键 + 加新键"实现，而**新键会走"新增整条"**：
+ *   浏览器拿不到已存的密码（宿主跨线前脱敏），那条 `set` 里的 `password` 只能是空串
+ *   —— 于是**改一次名就把密码清空**。键与名字解耦之后，改名只是改 `name` 字段
+ *   （深路径 op），同级的 `password` 原样留在宿主里。与 dsh-api-call 的 `users` 同构。
  */
 export interface SqlConnectionConfig {
+  /** 连接名（业务名）。工具调用的 `connection` 参数认的就是它。 */
+  name: string
   engine: 'sqlite' | 'mysql' | 'postgres'
   file?: string
   host?: string
@@ -31,13 +42,6 @@ export interface SqlConnectionConfig {
 }
 
 /**
- * 设置文件的形状 —— **也是运行时的形状**（读写同一份，没有第二套解析结果）。
- *
- * 字段都是可选的：这是**文件里可能是什么样**的声明。经 `normalizeSettings` 读进来的
- * 那份一定带 `connections`（缺失会兜成 `{}`），但 `activeEnv` / `environments` / `maxRows`
- * 仍可能缺席 —— 它们各有各的默认/校验点，见 `isReadOnly` / `requireMaxRows`。
- */
-/**
  * 一个环境。
  *
  * **只有名字** —— 与 dsh-api-call 的 environment 不同，SQL 连接的环境没有 baseUrl
@@ -50,6 +54,13 @@ export interface SqlEnvironmentConfig {
   name: string
 }
 
+/**
+ * 设置的形状 —— **也是运行时的形状**（读写同一份，没有第二套解析结果）。
+ *
+ * 字段都是可选的：这是**配置里可能是什么样**的声明。经 `normalizeSettings` 读进来的
+ * 那份一定带 `connections`（缺失会兜成 `{}`），但 `activeEnv` / `environments` / `maxRows`
+ * 仍可能缺席 —— 它们各有各的默认/校验点，见 `isReadOnly` / `requireMaxRows`。
+ */
 export interface SqlSettings {
   /** 当前环境名；空串 = 未设置。必须在 environments 里。 */
   activeEnv?: string
@@ -71,7 +82,16 @@ export interface SqlSettings {
    *   旧配置（0.4.x 及以前）请手工改成新形状，或删掉让插件重新生成。
    */
   environments?: Record<string, SqlEnvironmentConfig>
-  /** 连接表：键即连接名（区分大小写）。 */
+  /**
+   * 连接清单：**随机 id → { name, engine, ... }**。
+   *
+   * 键是**与显示名无关的随机 id**（跟 `environments` 同构），业务上引用连接一律用条目的
+   * `name` —— 工具调用的 `connection` 参数、连接自己的 `env`、报告里显示的都是名字。
+   *
+   * ⚠ **不能用名字当键**：连接改名当时只能"删旧键 + 加新键"，而新键会走"新增整条"，
+   *   浏览器拿不到已存的密码（宿主脱敏），那条 op 里的 `password` 只能是空串 ——
+   *   **改一次名就把密码清空**。键与名字解耦后，改名只是改 `name` 字段。
+   */
   connections?: Record<string, SqlConnectionConfig>
   maxRows?: number
 }
@@ -89,22 +109,6 @@ export function environmentNames(settings: SqlSettings): string[] {
     .map((entry) => (entry !== null && typeof entry === 'object' ? entry.name : undefined))
     .filter((name): name is string => typeof name === 'string' && name !== '')
 }
-
-/**
- * 按**显示名**取出一个环境（键是 id，名字只是条目里的一个字段）。
- *
- * 找不到返回 `undefined` —— 调用方自己决定是抛错还是当空处理。
- */
-export function findEnvironmentByName(settings: SqlSettings, name: string): SqlEnvironmentConfig | undefined {
-  const dict = settings.environments
-  if (dict === null || typeof dict !== 'object' || Array.isArray(dict)) return undefined
-  for (const entry of Object.values(dict)) {
-    if (entry !== null && typeof entry === 'object' && entry.name === name) return entry
-  }
-  return undefined
-}
-
-const ENGINES = ['sqlite', 'mysql', 'postgres'] as const
 
 /**
  * 单次查询超时。**代码常量，不可配置** —— Harness 的 `timeoutMs` 在工具注册时求值一次，
@@ -134,8 +138,6 @@ export function passwordEnvName(name: string): string {
   return 'DSH_SQL_PASSWORD_' + name.toUpperCase().replace(/[^A-Z0-9_]/g, '_')
 }
 
-/** description 字段最大长度；超长由设置页的 schema 拦下（读取侧不校验也不截断）。 */
-export const DESCRIPTION_MAX_LENGTH = 100
 
 /**
  * readOnly 的**生效值**：只有显式 `false` 才可写，其余一律只读。
@@ -143,9 +145,8 @@ export const DESCRIPTION_MAX_LENGTH = 100
  * fail-safe 的判断点就在这里 —— 认不出来的值（`"true"` / `1` / `"false"` / 缺省）
  * 全按只读。写权限是危险的那一侧，宁可挡住也不能悄悄给库开写权限。
  *
- * **不在解析层兜底**（不像 `readOnly` 曾经那样把结果写回设置对象）：配置文件里写的是什么
- * 就是什么，只在用的时候判。这样"读的"和"写的"永远是同一份，也不会因为读一次就把
- * `readOnly: true` 落到每个连接上。
+ * **不在解析层兜底**：配置里写的是什么就是什么，只在用的时候判。这样"读的"和
+ * "写的"永远是同一份，也不会因为读一次就把 `readOnly: true` 落到每个连接上。
  *
  * 值非法时 `sql_settings` 会把它列进「问题」——那里直接看原值判（见 `readOnlyProblem`）。
  */
@@ -235,8 +236,8 @@ export function fillConnectionKeys(connection: SqlConnectionConfig): SqlConnecti
 /**
  * 列出连接缺少的必填字段（空数组 = 齐了）。
  *
- * **建连侧（`createAdapter`）用这一份规则** —— 从前写入侧（已删除的 `sql_connection_set`）
- * 也用它，两处各写一遍必然漂移（曾经就出现过报错顺序不一致）。措辞由调用方拼，规则只此一处。
+ * **建连侧（`createAdapter`）用这一份规则** —— 措辞由调用方拼，规则只此一处，
+ * 两处各写一遍必然漂移（报错顺序都会不一致）。
  *
  * ⚠ **它管不了"保存时"**：条件是随 engine 变的（sqlite 要 file、mysql/pg 要 host+port、
  *   pg 还要 database），而 schemastery 的 schema 只能表达**单字段**的约束，
@@ -261,35 +262,55 @@ export function missingConnectionFields(connection: SqlConnectionConfig): string
 }
 
 /**
- * 按 activeEnv 切分连接：能用的 / 不能用的。
+ * 按**显示名**取出一个连接（键是随机 id，名字只是条目里的一个字段）。
+ *
+ * 找不到返回 `undefined` —— 调用方自己决定是抛错还是当空处理。
+ * 名字区分大小写，与工具层 `connection` 参数的语义一致。
+ */
+export function findConnectionByName(settings: SqlSettings, name: string): SqlConnectionConfig | undefined {
+  const dict = settings.connections
+  if (dict === null || typeof dict !== 'object' || Array.isArray(dict)) return undefined
+  for (const entry of Object.values(dict)) {
+    if (entry !== null && typeof entry === 'object' && entry.name === name) return entry
+  }
+  return undefined
+}
+
+/**
+ * 连接清单里的**全部名字**（跳过没有 name 的畸形条目）。
+ *
+ * 顺序是插入顺序，也就是用户添加的先后 —— 报告与「⚠ 问题」节照这个顺序列。
+ */
+export function connectionNames(settings: SqlSettings): string[] {
+  const dict = settings.connections
+  if (dict === null || typeof dict !== 'object' || Array.isArray(dict)) return []
+  return Object.values(dict)
+    .map((entry) => (entry !== null && typeof entry === 'object' ? entry.name : undefined))
+    .filter((name): name is string => typeof name === 'string' && name !== '')
+}
+
+/**
+ * 挑出在 `activeEnv` 下**可用**的连接。
  *
  * 匹配规则只有一条：`env` 为空的连接**任何环境都算可用**，否则要求 `env === activeEnv`。
- * 没匹配上的一律算「其它环境」。
  *
- * 两侧都返回**连接表**（键即名字）而不是数组 —— 名字本来就在键上，摊平成数组反而
- * 让每个消费点都得靠 `.name` 反查。
+ * 返回**「名字 → 连接定义」**的字典，而不是条目字典（id 是键的那种）——
+ * 消费点（探活、报告）认的是业务名字，用名字当键让它们不用再反查一次。
  *
  * `activeEnv` 为空时没有连接能靠「环境名相同」匹配，因此只有 `env` 为空的那批可用 —— 与设了环境时同一套规则。
  */
-export function splitConnectionsByEnv(settings: SqlSettings): {
-  available: Record<string, SqlConnectionConfig>
-  excluded: Record<string, SqlConnectionConfig>
-} {
+export function splitConnectionsByEnv(settings: SqlSettings): Record<string, SqlConnectionConfig> {
   const activeEnv = typeof settings.activeEnv === 'string' ? settings.activeEnv.trim() : ''
-  // 环境清单是「id → { name }」的字典，业务上认的是**名字** —— 先摊成名字列表。
-  const envNames = environmentNames(settings)
   const available: Record<string, SqlConnectionConfig> = {}
-  const excluded: Record<string, SqlConnectionConfig> = {}
-  for (const [name, connection] of Object.entries(settings.connections ?? {})) {
+  for (const connection of Object.values(settings.connections ?? {})) {
+    const name = typeof connection?.name === 'string' ? connection.name : ''
+    if (name === '') continue // 畸形条目（没有名字）谁都引用不到，跳过
     // `env` 空白（或没写）都算"不限环境"：空白串不是合法环境名，当成"属于名字是空白的
     // 环境"会让这条连接在**任何**环境下都匹配不上，凭空消失。
-    const env = typeof connection?.env === 'string' ? connection.env.trim() : ''
-    if (env === '') { available[name] = connection; continue }
-    if (env === activeEnv) { available[name] = connection; continue }
-    // `env` 指向一个**不存在的环境**：既不是"不限环境"，也不属于任何现存环境，
-    // 所以 two 组都不进 —— 它会出现在「其它环境」那份索引里的话，看着像"还能用"，
-    // 实际在任何环境下都不会出现。这种情况由 sql_settings 的「⚠ 问题」节点名。
-    if (envNames.includes(env)) excluded[name] = connection
+    const env = typeof connection.env === 'string' ? connection.env.trim() : ''
+    // `env` 指向一个**不存在的环境**时这里自然落空（既不等于 activeEnv，也不是空串）——
+    // 那种连接在任何环境下都不会出现，由 sql_settings 的「⚠ 问题」节点名。
+    if (env === '' || env === activeEnv) available[name] = connection
   }
-  return { available, excluded }
+  return available
 }

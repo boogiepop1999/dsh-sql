@@ -15,17 +15,17 @@ import {
   EXEC_TIMEOUT_MS,
   STATS_TIMEOUT_MS,
 } from '../lib/index.js'
+import { conns, oneConn } from './_fixtures.mjs'
 
 // 这一份测的是**纯函数**：设置怎么读进来（normalizeSettings）、
 // 以及运行时怎么取值（isReadOnly / requireMaxRows / splitConnectionsByEnv）。
-// 以前这里有一整套 resolveSettings 的用例；那一层已删除，行为搬到了使用处。
 // 「使用处」的行为由 tools.test.mjs / settings-tools.test.mjs 覆盖。
 
 test('normalizeSettings：只查顶层形状 + 剔未知字段', () => {
   const out = normalizeSettings({
     activeEnv: 'qa',
     environments: { e1: { name: 'qa' } },
-    connections: { a: { engine: 'sqlite', file: ':memory:' } },
+    connections: oneConn('a', { engine: 'sqlite', file: ':memory:' }),
     maxRows: 500,
     unknownTop: '丢掉',
   })
@@ -34,7 +34,7 @@ test('normalizeSettings：只查顶层形状 + 剔未知字段', () => {
   assert.equal(out.maxRows, 500)
   assert.equal(out.unknownTop, undefined, '未知顶层字段被剔除')
   // 连接内部的字段**一概不动** —— 没有 trim、没有类型过滤、不补默认值
-  assert.deepEqual(out.connections.a, { engine: 'sqlite', file: ':memory:' })
+  assert.deepEqual(out.connections.c1, { name: 'a', engine: 'sqlite', file: ':memory:' })
 })
 
 test('normalizeSettings：connections 缺失兜底成空对象', () => {
@@ -47,7 +47,7 @@ test('normalizeSettings：顶层不是对象 / connections 不是对象 / enviro
   assert.throws(() => normalizeSettings(null), /顶层必须是一个对象/)
   assert.throws(() => normalizeSettings([]), /顶层必须是一个对象/)
   assert.throws(() => normalizeSettings('x'), /顶层必须是一个对象/)
-  assert.throws(() => normalizeSettings({ connections: [] }), /connections 必须是一个对象/)
+  assert.throws(() => normalizeSettings({ connections: [] }), /connections 必须是/)
   assert.throws(() => normalizeSettings({ environments: 'nope' }), /environments 必须是「id → \{ name \}」的对象/)
 })
 
@@ -64,16 +64,16 @@ test('normalizeSettings：不做归一化（无 trim、无默认值、不校验�
   const long = 'x'.repeat(150)
   const out = normalizeSettings({
     activeEnv: '  qa  ',
-    connections: {
+    connections: conns({
       a: { engine: 'oracle' },                          // 非法引擎也原样读出
       b: { engine: 'sqlite', env: '  ', description: long, readOnly: 'true' },
-    },
+    }),
   })
-  assert.equal(out.activeEnv, '  qa  ', '不 trim —— 读到的就是文件里的')
-  assert.equal(out.connections.a.engine, 'oracle', '不校验引擎')
-  assert.equal(out.connections.b.env, '  ', '不 trim')
-  assert.equal(out.connections.b.description, long, '不截断')
-  assert.equal(out.connections.b.readOnly, 'true', '类型也原样保留')
+  assert.equal(out.activeEnv, '  qa  ', '不 trim —— 读到的就是配置里的')
+  assert.equal(out.connections.c1.engine, 'oracle', '不校验引擎')
+  assert.equal(out.connections.c2.env, '  ', '不 trim')
+  assert.equal(out.connections.c2.description, long, '不截断')
+  assert.equal(out.connections.c2.readOnly, 'true', '类型也原样保留')
 })
 
 test('normalizeSettings：maxRows 非法不在这里抛（由 requireMaxRows 把关）', () => {
@@ -189,31 +189,30 @@ test('passwordEnvName：连接名 → 环境变量名', () => {
 // 现在直接收设置本体（不再有"解析后"的中间形状）
 
 test('splitConnectionsByEnv：当前环境的 + 未标环境的可用，其它环境排除', () => {
-  const { available, excluded } = splitConnectionsByEnv({
+  const available = splitConnectionsByEnv({
     activeEnv: 'qa',
     environments: { e1: { name: 'qa' }, e2: { name: 'pro' } },
-    connections: {
+    connections: conns({
       'qa-db': { engine: 'sqlite', env: 'qa' },
       'pro-db': { engine: 'sqlite', env: 'pro' },
       common: { engine: 'sqlite' },
       'blank-env': { engine: 'sqlite', env: '   ' },
-    },
+    }),
   })
   assert.deepEqual(Object.keys(available), ['qa-db', 'common', 'blank-env'])
-  assert.deepEqual(Object.keys(excluded), ['pro-db'])
+  assert.equal(Object.prototype.hasOwnProperty.call(available, 'pro-db'), false, '别的环境的不在结果里')
 })
 
 test('splitConnectionsByEnv：activeEnv 为空时只有不限环境的可用', () => {
-  const { available, excluded } = splitConnectionsByEnv({
+  const available = splitConnectionsByEnv({
     environments: { e1: { name: 'qa' }, e2: { name: 'pro' } },
-    connections: {
+    connections: conns({
       'qa-db': { engine: 'sqlite', env: 'qa' },
       'pro-db': { engine: 'sqlite', env: 'pro' },
       common: { engine: 'sqlite' },
-    },
+    }),
   })
   assert.deepEqual(Object.keys(available), ['common'], '没设环境 → 只有不限环境的')
-  assert.deepEqual(Object.keys(excluded), ['qa-db', 'pro-db'], '带环境的一律算其它环境')
 })
 
 test('splitConnectionsByEnv：环境名区分大小写；activeEnv 会 trim', () => {
@@ -221,38 +220,35 @@ test('splitConnectionsByEnv：环境名区分大小写；activeEnv 会 trim', ()
   const upper = splitConnectionsByEnv({
     activeEnv: 'QA',
     environments,
-    connections: { 'qa-db': { engine: 'sqlite', env: 'qa' } },
+    connections: oneConn('qa-db', { engine: 'sqlite', env: 'qa' }),
   })
-  assert.deepEqual(Object.keys(upper.available), [], 'QA ≠ qa')
-  assert.deepEqual(Object.keys(upper.excluded), ['qa-db'])
+  assert.deepEqual(Object.keys(upper), [], 'QA ≠ qa')
 
   const padded = splitConnectionsByEnv({
     activeEnv: '  qa  ',
     environments,
-    connections: { 'qa-db': { engine: 'sqlite', env: 'qa' } },
+    connections: oneConn('qa-db', { engine: 'sqlite', env: 'qa' }),
   })
-  assert.deepEqual(Object.keys(padded.available), ['qa-db'], 'activeEnv 两侧空白应被忽略')
+  assert.deepEqual(Object.keys(padded), ['qa-db'], 'activeEnv 两侧空白应被忽略')
 })
 
-test('splitConnectionsByEnv：env 指向不存在的环境时，两组都不进', () => {
-  // 它既不是"不限环境"，也不属于任何现存环境 —— 混进「其它环境」那份索引会让人
-  // 以为"还能用"，实际在任何环境下都不会出现。这种情况交给 sql_settings 的问题节点名。
-  const { available, excluded } = splitConnectionsByEnv({
+test('splitConnectionsByEnv：env 指向不存在的环境时也不可用', () => {
+  // 它既不是"不限环境"，也不匹配 activeEnv —— 在任何环境下都不会出现。
+  // 这种情况交给 sql_settings 的问题节点名，别让人以为它还能用。
+  const available = splitConnectionsByEnv({
     activeEnv: 'qa',
     environments: { e1: { name: 'qa' }, e2: { name: 'prod' } },
-    connections: {
+    connections: conns({
       'in-qa': { engine: 'sqlite', env: 'qa' },
       'in-prod': { engine: 'sqlite', env: 'prod' },
       free: { engine: 'sqlite', env: '' },
       ghost: { engine: 'sqlite', env: 'nope' },
-    },
+    }),
   })
   assert.deepEqual(Object.keys(available).sort(), ['free', 'in-qa'])
-  assert.deepEqual(Object.keys(excluded), ['in-prod'], '只有"有效的其它环境"才进索引')
+  assert.equal(Object.prototype.hasOwnProperty.call(available, 'ghost'), false, '指向不存在的环境 = 不可用')
 })
 
-test('splitConnectionsByEnv：connections 缺失时返回两个空表，不崩', () => {
-  const { available, excluded } = splitConnectionsByEnv({ activeEnv: 'qa' })
-  assert.deepEqual(available, {})
-  assert.deepEqual(excluded, {})
+test('splitConnectionsByEnv：connections 缺失时返回空表，不崩', () => {
+  assert.deepEqual(splitConnectionsByEnv({ activeEnv: 'qa' }), {})
 })

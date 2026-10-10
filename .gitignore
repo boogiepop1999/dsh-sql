@@ -3,6 +3,12 @@ node_modules/
 .DS_Store
 .idea/
 
+# 编译产物：源码在 src/，lib/ 由 `pnpm run build` 生成。
+# 入库过一段时间，会导致"改了 src 忘了编译"的静默漂移 —— 插件跑的是 lib/，
+# 而 git 里那份可能是旧的。发布走 prepublishOnly（见 package.json），安装方
+# 拿到的是构建后的包。
+lib/
+
 # 不锁版本：依赖只有三个（schemastery / mysql2 / pg），都是稳定的老包，
 # 且 schemastery 的版本实际由宿主决定 —— 锁在本机没意义。
 pnpm-lock.yaml

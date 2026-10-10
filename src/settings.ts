@@ -10,13 +10,8 @@
  * 配置对象由 `apply(ctx, config)` 拿到，工具**每次调用时现取**（见 `index.ts` 的
  * `configReader`），所以"改完下一次调用生效"成立 —— 刷新时机由宿主的文档镜像决定。
  *
- * ## 从前这里有文件 I/O
- *
- * 0.4.x 时配置在 `$DSH_HOME/sql/settings.json`，这个文件负责读写它
- * （`loadSettings` / `saveSettings` / `writeJsonAtomic` / `pluginDataDir`）。
- * 那些**全部删除**了：写进去宿主的 settings 服务（带 schema 校验、revision 栅栏、
- * 失败回滚），读也从宿主配置来 —— 两套数据源迟早会分不清谁是真的（真出过：
- * 设置页显示 5 个连接、而工具有的是空配置）。
+ * ⚠ **本模块不许引入文件读写**：读的 settings 和写的 settings 必须是同一份，
+ *   一旦多了个文件当数据源，就会变成"设置页显示 5 个连接、而工具有的是空配置"。
  *
  * @module dsh-sql/settings
  */
@@ -58,11 +53,11 @@ export function normalizeSettings(raw: unknown): SqlSettings {
   }
   if (source.connections !== undefined) {
     if (typeof source.connections !== 'object' || source.connections === null || Array.isArray(source.connections)) {
-      throw new Error('connections 必须是一个对象（键即连接名）。')
+      throw new Error('connections 必须是「id → { name, engine, ... }」的对象。')
     }
     out.connections = source.connections as Record<string, SqlConnectionConfig>
   } else {
-    // 缺失时兜底成空对象 —— 下游到处写 `settings.connections[name]`，undefined 会直接崩
+    // 缺失时兜底成空对象 —— 下游到处遍历 `settings.connections`，undefined 会直接崩
     out.connections = {}
   }
   if (source.maxRows !== undefined) out.maxRows = source.maxRows as number

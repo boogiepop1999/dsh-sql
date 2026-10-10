@@ -53,6 +53,18 @@ function conn(overrides = {}) {
   }
 }
 
+/**
+ * 把「按名字写的连接表」转成配置真正的形状（**随机 id → { name, ... }**）。
+ *
+ * 与 `envs()` 同一个思路：用例里按名字写读起来清楚，id 用可预测的短串方便断言。
+ * 键不能直接用连接名 —— 那会让改名变成删旧键 + 加新键，清空密码（见 src/config.ts）。
+ */
+function conns(byName) {
+  return Object.fromEntries(
+    Object.entries(byName).map(([name, entry], i) => ['c' + (i + 1), { name, ...entry }]),
+  )
+}
+
 test('只注册 sql_settings 一个工具（配置编辑已搬到设置页）', () => {
   const names = buildSettingsTools().map((t) => t.name).sort()
   assert.deepEqual(names, ['sql_settings'])
@@ -71,7 +83,7 @@ test('每个工具的 schema 是 object JSON Schema', () => {
 test('sql_settings：空配置正常渲染 + 三条告警', async () => {
   const box = makeSandbox()
   const value = await box.tool('sql_settings').execute({})
-  assert.match(value.report, /# dsh-sql — 当前环境（空），0 个可见连接/)
+  assert.match(value.report, /# dsh-sql — 当前环境（空），0 个连接可用/)
   assert.match(value.report, /environments 为空/)
   assert.match(value.report, /activeEnv 未设置/)
   assert.match(value.report, /还没有任何连接/)
@@ -83,20 +95,20 @@ test('sql_settings：空配置正常渲染 + 三条告警', async () => {
 
 test('sql_settings：只读与描述出现在报告里', async () => {
   const box = makeSandbox({
-    connections: { prod: conn({ file: '/tmp/p.db', readOnly: true, description: '生产库，慎写' }) },
+    connections: conns({ prod: conn({ file: '/tmp/p.db', readOnly: true, description: '生产库，慎写' }) }),
   })
   const value = await box.tool('sql_settings').execute({})
   assert.match(value.report, /🔒 是/)
   assert.match(value.report, /生产库，慎写/)
 })
 
-test('sql_settings：报告里指路到插件设置页（不再提配置文件）', async () => {
-  // 配置编辑已经搬到设置页，落盘位置（profile 的 cordis.patch.yml）是宿主的内部实现 ——
-  // 报告里不该再出现文件路径让人去手改。
+test('sql_settings：报告里不出现任何文件路径（配置的位置是宿主的内部实现）', async () => {
+  // 配置编辑在插件设置页，落盘位置（profile 的 cordis.patch.yml）跟使用者无关 ——
+  // 报告里不该出现路径让人去手改；「配置位置」那一行本身也已经删掉了。
   const box = makeSandbox()
   const value = await box.tool('sql_settings').execute({})
-  assert.match(value.report, /配置位置 \| 插件设置页/)
-  assert.doesNotMatch(value.report, /settings\.json|\.dsh[\\/]sql/)
+  assert.doesNotMatch(value.report, /配置位置/, '那一行已删除')
+  assert.doesNotMatch(value.report, /settings\.json|\.dsh[\\/]|cordis\.patch/)
 })
 
 test('sql_settings：值不对（不是格式坏）时照常渲染，只在问题节里指路', async () => {
@@ -119,11 +131,11 @@ test('sql_settings：连接表的环境列，空 env 显示「不限环境」（
   box.write({
     environments: envs('qa'),
     activeEnv: 'qa',
-    connections: {
+    connections: conns({
       'no-env': conn(),
       'blank-env': conn({ env: '   ' }),
       'in-qa': conn({ env: 'qa' }),
-    },
+    }),
   })
 
   const value = await box.tool('sql_settings').execute({})
@@ -140,42 +152,40 @@ test('sql_settings：按 activeEnv 筛选，留空的连接哪个环境都列', 
   box.write({
     environments: envs('qa', 'prod'),
     activeEnv: 'qa',
-    connections: {
+    connections: conns({
       'qa-only': conn({ env: 'qa' }),
       'prod-only': conn({ env: 'prod' }),
       anywhere: conn(),
-    },
+    }),
   })
 
   const value = await box.tool('sql_settings').execute({})
   assert.match(value.report, /当前环境 qa/)
-  // 当前环境可用：qa-only + anywhere（留空）；prod-only 不在表里
+  // 当前环境可用：qa-only + anywhere（留空）；prod-only 完全不出现在报告里
   assert.match(value.report, /qa-only/)
   assert.match(value.report, /anywhere/)
-  assert.match(value.report, /其它环境的连接：prod-only/)
-  // prod-only 只出现在「其它环境」那行，不进表
+  assert.doesNotMatch(value.report, /prod-only/, '别的环境的连接不列（报告只讲当前环境）')
   const tableRows = value.report.split('\n').filter((line) => line.startsWith('| ') && line.includes('| sqlite |'))
   assert.equal(tableRows.some((row) => row.includes('prod-only')), false)
 })
 
-test('sql_settings：activeEnv 为空时只列不限环境的，带环境的进「其它环境」', async () => {
+test('sql_settings：activeEnv 为空时只列不限环境的，带环境的完全不列', async () => {
   const box = makeSandbox()
   box.write({
     environments: envs('qa', 'prod'),
-    connections: {
+    connections: conns({
       'qa-only': conn({ env: 'qa' }),
       'prod-only': conn({ env: 'prod' }),
       scratch: conn(),
-    },
+    }),
   })
 
   const value = await box.tool('sql_settings').execute({})
-  assert.match(value.report, /当前环境（空），1 个可见连接/)
-  assert.match(value.report, /## 可见连接（不限环境）/)
+  assert.match(value.report, /当前环境（空），1 个连接可用/)
+  assert.match(value.report, /## 连接（当前环境可用）/)
   assert.match(value.report, /scratch/)
-  assert.match(value.report, /其它环境的连接：qa-only、prod-only/)
-  assert.doesNotMatch(value.report, /\| qa-only \|/, '带环境的连接不进可用表')
-  assert.doesNotMatch(value.report, /\| prod-only \|/, '带环境的连接不进可用表')
+  assert.doesNotMatch(value.report, /qa-only/, '带环境的连接进不了可用表，也不另列一行')
+  assert.doesNotMatch(value.report, /prod-only/)
 })
 
 test('sql_settings：activeEnv 设了环境时，当前环境的 + default 的同列可用', async () => {
@@ -183,19 +193,19 @@ test('sql_settings：activeEnv 设了环境时，当前环境的 + default 的�
   box.write({
     environments: envs('qa', 'prod'),
     activeEnv: 'qa',
-    connections: {
+    connections: conns({
       'qa-only': conn({ env: 'qa' }),
       'prod-only': conn({ env: 'prod' }),
       scratch: conn(),
-    },
+    }),
   })
 
   const value = await box.tool('sql_settings').execute({})
-  assert.match(value.report, /当前环境 qa，2 个可见连接/)
-  assert.match(value.report, /## 可见连接（当前环境 qa）/)
+  assert.match(value.report, /当前环境 qa，2 个连接可用/)
+  assert.match(value.report, /## 连接（当前环境可用）/)
   assert.match(value.report, /\| qa-only \|/)
   assert.match(value.report, /\| scratch \|/, '不限环境的连接在任何环境都可用')
-  assert.match(value.report, /其它环境的连接：prod-only/)
+  assert.doesNotMatch(value.report, /prod-only/, '别的环境的连接不列')
 })
 
 test('sql_settings：环境清单被改小后，落到范围外的 activeEnv / 连接 env 都在问题节报出来', async () => {
@@ -206,7 +216,7 @@ test('sql_settings：环境清单被改小后，落到范围外的 activeEnv / �
   box.write({
     environments: envs('qa', 'prod'),
     activeEnv: 'prod',
-    connections: { 'prod-db': conn({ env: 'prod' }) },
+    connections: conns({ 'prod-db': conn({ env: 'prod' }) }),
   })
 
   // 模拟"在设置页删了环境但没改引用"：换一份少一个环境的配置

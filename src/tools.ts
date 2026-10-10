@@ -7,7 +7,7 @@
  */
 import { defineTool, type AuthorSchema } from '@deepseek-ai/dsh-tools'
 import { createAdapter, type DatabaseAdapter } from './adapters.js'
-import { type SqlSettings, type SqlConnectionConfig, isReadOnly, requireMaxRows, passwordEnvName, splitConnectionsByEnv, QUERY_TIMEOUT_MS, EXEC_TIMEOUT_MS, STATS_TIMEOUT_MS } from './config.js'
+import { type SqlSettings, type SqlConnectionConfig, findConnectionByName, isReadOnly, requireMaxRows, passwordEnvName, splitConnectionsByEnv, QUERY_TIMEOUT_MS, EXEC_TIMEOUT_MS, STATS_TIMEOUT_MS } from './config.js'
 import { countStatements, splitStatements, stripSqlNoise } from './sql-lex.js'
 import {
   asRecord,
@@ -58,8 +58,7 @@ const querySchema: AuthorSchema = {
     columns: { type: 'array', items: { type: 'string' } },
     // 行是"数组的数组"，单元格是任意值 —— 用作者侧的 `json`（编译成只带注释的 schema）。
     // ⚠ 不能写 `items: {}`：宿主会 `assertSupportedJsonSchema`，空节点会被拒
-    //   （`...items.type must be string/number/... or use oneOf`）。这是**切到
-    //   defineTool 之后才暴露的** —— 从前手写的 schema 宿主根本不校验。
+    //   （`...items.type must be string/number/... or use oneOf`）。
     rows: { type: 'array', items: { type: 'array', items: { type: 'json' } } },
     rowCount: { type: 'integer' },
     truncated: { type: 'boolean' },
@@ -205,11 +204,8 @@ function connectionFingerprint(connection: NamedSqlConnection): string {
 }
 
 /**
- * 一个 `defineTool` 产出的工具定义 —— **类型从宿主推断**，不再自己声明。
- *
- * 早先这里用自造的 `SqlToolDefinition`，那玩意儿的 `parameters` 是手写的 JSON Schema，
- * 宿主**不会校验**（它的校验读的是 `defineTool` 归一化后的 schema）。
- * 现在直接用 `ReturnType<typeof defineTool>`，跟宿主完全对齐。
+ * `defineTool` 产出的工具定义 —— **类型从宿主推断**，别自己声明：
+ * 自造的 `parameters` 是手写 JSON Schema，宿主不会校验它。
  */
 type SqlToolDefinition = ReturnType<typeof defineTool>
 
@@ -232,7 +228,7 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
    * ⚠ 这里的 `name === undefined` 检查**不是入参校验**（那归 `defineTool`：
    *   `connection: { required: true }` 已经在 execute 之前拦下了"没传"）。
    *   它的作用是**类型收窄** —— 签名是 `string | undefined`，收成 `string` 之后
-   *   下面 `cfg.connections?.[name]` 才不用到处写断言。
+   *   下面按名字查找才不用到处写断言。
    *
    *   真触发到它，说明有人**绕过 defineTool 直接调这个内部函数**（比如测试），
    *   所以文案也照旧说得清楚。
@@ -242,18 +238,18 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
       throw new Error('必须显式指定 connection 参数（不再有默认连接）。可用 sql_settings 查看连接清单。')
     }
     const cfg = loadConfig()
-    // 连接表以名字为键，直接取即可 —— 不用再遍历找 .name
-    const stored = cfg.connections?.[name]
+    // 键是随机 id，名字是条目里的字段 —— 按名字找（与 environments 同一套寻址方式）。
+    const stored = findConnectionByName(cfg, name)
     if (stored === undefined) {
       throw new Error('未找到名为 ' + name + ' 的数据库连接。可用 sql_settings 查看连接清单。')
     }
     /**
-     * 密码可走环境变量：**文件里的明文优先，没有才取 `DSH_SQL_PASSWORD_<连接名大写>`**。
+     * 密码可走环境变量：**配置里的明文优先，没有才取 `DSH_SQL_PASSWORD_<连接名大写>`**。
      *
-     * 合流只在**这里**做（用的时候现算），**绝不写回设置文件** —— 读的 settings 就是写的
+     * 合流只在**这里**做（用的时候现算），**绝不写回配置** —— 读的 settings 就是写的
      * 那份，一旦在解析层合流，环境变量里的密钥就会被落盘成明文。
      */
-    const connection: NamedSqlConnection = { name, ...stored }
+    const connection: NamedSqlConnection = { ...stored, name }
     if (connection.password === undefined || connection.password === '') {
       const fromEnv = process.env[passwordEnvName(name)]?.trim() ?? ''
       if (fromEnv !== '') connection.password = fromEnv
@@ -285,11 +281,11 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
   /** 逐连接并发探活：串行下 N 个不通要等 N 次超时，并发只等最慢的一个。只探在 activeEnv 下可见的连接。 */
   const pingAllConnections = async (signal?: AbortSignal): Promise<Array<Record<string, unknown>>> => {
     const cfg = loadConfig()
-    const { available } = splitConnectionsByEnv(cfg)
+    const available = splitConnectionsByEnv(cfg)
     return await Promise.all(Object.entries(available).map(async ([name, connection]) => {
       const entry: Record<string, unknown> = { name }
       try {
-        await adapterFor({ name, ...connection }).ping(signal)
+        await adapterFor(connection).ping(signal)
         entry.ok = true
         entry.error = ''
       } catch (error) {
@@ -483,7 +479,12 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
       const signal = executionSignal(exec)
       // MySQL 的库体积与表清单都依赖「当前库」，而 database 是可选的。
       // 不设默认库时不猜也不绕（DATABASE() 会返回 NULL，静默给出空结果），如实标记不可用。
-      const noDefaultDb = engine === 'mysql' && connection.database === undefined
+      //
+      // ⚠ 「没设」要按**空串**判，不能只判 undefined：新建连接会被
+      //   `fillConnectionKeys` 补上 `database: ''`，schema 的 `.default('')` 也给空串，
+      //   而 `'' !== undefined` —— 只判 undefined 的话这个分支永远不命中，接着就会去查
+      //   `WHERE TABLE_SCHEMA = ''`，返回 0 行，把"没选库"谎报成"这个库是空的"。
+      const noDefaultDb = engine === 'mysql' && (connection.database ?? '') === ''
       let sizeBytes = -1
       let sizeError = ''
       if (noDefaultDb) {
