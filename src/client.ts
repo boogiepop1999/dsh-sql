@@ -113,24 +113,37 @@ window.__ModuleLoader__.load({
 
       envTitle: '环境',
       envName: '环境名',
-      envNamePlaceholder: '如 qa / prod',
       emptyEnvs: '还没有环境。',
 
       connTitle: '连接',
       connName: '连接名',
-      connNamePlaceholder: '如 polar',
       emptyConns: '还没有连接。',
       connEngine: '引擎',
       connFile: '数据库文件',
-      connFilePlaceholder: 'SQLite 文件路径，如 :memory:',
       connHost: '主机',
       connUser: '用户',
       connPassword: '密码',
       connDatabase: '数据库',
       connEnv: '限定环境',
-      connEnvPlaceholder: '留空表示不限定环境',
       connReadOnly: '只读',
       connDescription: '用途说明',
+
+      /**
+       * placeholder 的两条规则（都写在**输入框内部**，不是行下面的说明）。
+       *
+       * ① **必填的写「必填」，非必填的留空** —— 早先每栏都塞"如 polar"这种示例，
+       *    非必填的栏也顶着字，反而看不出哪个是必须的；示例还容易被照抄成一个
+       *    填不出地址的假值。必填就说必填，具体填什么用户自己知道。
+       *
+       * ② **规则不显然的**（留空会怎样）才给一句话 —— 目前只有两处：
+       *    `env` 留空 = 不限环境、mysql 的 `database` 留空会失去什么。
+       *    像 host/port 这种一看就知道的不写，写了只是噪音。
+       */
+      required: '必填',
+      phEnv: '留空表示不限定环境',
+      // mysql 的 database 非必填，但留空有代价 —— 一句说清，短到能塞进输入框
+      phDatabaseMysql: '可留空（库体积/表清单将不可用）',
+
       // 密码框永远是空的（宿主脱敏），一句把"没动"和"要改"都说清
       passwordPlaceholder: '留空表示不改动，输入新值可替换',
 
@@ -158,24 +171,25 @@ window.__ModuleLoader__.load({
 
       envTitle: 'Environments',
       envName: 'Name',
-      envNamePlaceholder: 'e.g. qa / prod',
       emptyEnvs: 'No environments yet.',
 
       connTitle: 'Connections',
       connName: 'Connection name',
-      connNamePlaceholder: 'e.g. polar',
       emptyConns: 'No connections yet.',
       connEngine: 'Engine',
       connFile: 'Database file',
-      connFilePlaceholder: 'SQLite file path, e.g. :memory:',
       connHost: 'Host',
       connUser: 'User',
       connPassword: 'Password',
       connDatabase: 'Database',
       connEnv: 'Restricted to environment',
-      connEnvPlaceholder: 'Leave blank for any environment',
       connReadOnly: 'Read-only',
       connDescription: 'Description',
+
+      required: 'Required',
+      phEnv: 'Leave blank for any environment',
+      phDatabaseMysql: 'Optional (size and table list then unavailable)',
+
       passwordPlaceholder: 'Leave blank to keep it; type a new one to replace',
 
       addEnv: 'Add environment',
@@ -244,37 +258,6 @@ window.__ModuleLoader__.load({
       return head + body
     }
 
-    /** 生成一个与现有条目不冲突的显示名（用于"添加"）。这不是校验，只是省得先弹输入框。 */
-    function uniqueName(dict: Record<string, any>, base: string): string {
-      const taken: Record<string, boolean> = {}
-      for (const entry of Object.values(dict ?? {})) {
-        if (entry && typeof entry.name === 'string') taken[entry.name] = true
-      }
-      if (!taken[base]) return base
-      for (let n = 2; ; n++) {
-        const candidate = base + n
-        if (!taken[candidate]) return candidate
-      }
-    }
-
-    /**
-     * 生成一个与现有**连接名**不冲突的名字。
-     *
-     * ⚠ 查重看的是每个条目的 `name` 字段，**不是 `Object.keys`** —— 键是随机 id，
-     *   跟显示名无关（与环境那边同一套形状）。
-     */
-    function uniqueConnName(dict: Record<string, any>, base: string): string {
-      const taken: Record<string, boolean> = {}
-      for (const entry of Object.values(dict ?? {})) {
-        if (entry && typeof entry.name === 'string') taken[entry.name] = true
-      }
-      if (!taken[base]) return base
-      for (let n = 2; ; n++) {
-        const candidate = base + n
-        if (!taken[candidate]) return candidate
-      }
-    }
-
     // ── 样式 ──────────────────────────────────────────────────────────────
 
     const SECTION = { minWidth: 0, padding: '16px 0', borderTop: '1px solid rgba(128,128,128,.25)' }
@@ -294,29 +277,84 @@ window.__ModuleLoader__.load({
       border: '1px solid rgba(128,128,128,.3)',
       background: 'rgba(128,128,128,.05)',
     }
-    /** 卡片顶部那行：名字 + 删除。下面一条淡线跟字段区分开。 */
+    /**
+     * 卡片顶部那行：名字 + 引擎 + 只读 + 删除。下面一条淡线跟字段区分开。
+     *
+     * `alignItems: 'flex-end'`（不是 center）—— 名字/引擎都是「标签 + 控件」的竖排，
+     * 底边对齐才会让两个输入框齐平；用 center 的话有没有标签会决定高低，一眼就歪。
+     * 只读与删除是单行控件，靠 `marginBottom` 对齐到输入框那一行。
+     */
     const ROW_HEAD = {
-      display: 'flex', gap: '10px', alignItems: 'center',
+      display: 'flex', gap: '10px', alignItems: 'flex-end',
       paddingBottom: '10px', borderBottom: '1px solid rgba(128,128,128,.18)',
     }
     /** 两列布局：连接字段多，一列铺开太长。 */
     const GRID = { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }
     const FIELD = { display: 'flex', flexDirection: 'column', gap: '3px', minWidth: 0 }
     const LABEL = { fontSize: '11px', opacity: 0.65 }
+    /**
+     * 装 `Switch` 的盒子 —— 撑到与 `INPUT` 等高（`minHeight: 30px`），开关居中。
+     *
+     * 存在的唯一理由是**对齐**：`ROW_HEAD` 是 `alignItems: flex-end`，
+     * 而 Switch 比 input 矮。没有这层盒子，开关会贴行底、跟旁边的输入框错开一截。
+     */
+    const SWITCH_BOX = { display: 'flex', alignItems: 'center', minHeight: '30px' }
     const INPUT = {
       width: '100%', boxSizing: 'border-box', padding: '6px 9px', borderRadius: '6px',
       border: '1px solid rgba(128,128,128,.35)', background: 'transparent',
       color: 'inherit', font: 'inherit', fontSize: '12px', minHeight: '30px',
     }
+
+    /**
+     * `<select>` 的输入框样式 —— **不能直接用 `INPUT`**。
+     *
+     * ⚠ `INPUT.background: 'transparent'` 对文本框没问题（底下的卡片底色透出来），
+     *   但 `<select>` 的**下拉弹层是系统绘制的**，它不继承 `color`：深色主题下
+     *   弹层用系统默认的浅色底 + 我们传不下去的浅色字 → **白底白字，看不见选项**。
+     *   （截图里就是这个问题。）
+     *
+     * 所以 select 一律**不设 background / color**，全走浏览器默认 —— 弹层与收起态
+     * 由浏览器按当前配色方案自己配色，我们不去干预。
+     */
+    const SELECT = { ...INPUT, background: undefined, color: undefined }
+
     const BTN = {
       padding: '6px 12px', borderRadius: '6px', border: '1px solid rgba(128,128,128,.35)',
       background: 'transparent', color: 'inherit', font: 'inherit', fontSize: '12px', cursor: 'pointer',
     }
     const BTN_DANGER = { ...BTN, borderColor: 'rgba(220,90,90,.5)', color: '#e07a7a' }
-    const CHECKBOX_ROW = { display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', minHeight: '30px' }
 
     /** 引擎下拉的选项（顺序即展示顺序）。 */
     const ENGINES = ['sqlite', 'mysql', 'postgres'] as const
+
+    /** 新建连接的默认引擎。 */
+    const DEFAULT_ENGINE = 'mysql'
+
+    /**
+     * 新建连接时按引擎预置的字段（值一律"空 / 安全默认"）。
+     *
+     * ⚠ **必须与服务端 `connectionFieldKeys`（src/config.ts）的字段集对齐** ——
+     *   那份是"这个引擎有哪些字段"的唯一真源。client 是独立 bundle
+     *   （只 `require` react 与官方 primitives），require 不到服务端模块，
+     *   所以这里是它的浏览器侧副本。改了那边记得一起改。
+     *
+     * 不预置别的引擎的字段：sqlite 用不到 `host`/`port`，硬塞进去只会在配置里
+     * 留下一堆与这条连接无关的空键。
+     *
+     * `port` 特意是 `undefined` 而不是 0：0 不是合法端口，留 `undefined` 才能让
+     * 服务端的 `missingConnectionFields` 明确报"缺少 port"（见 `editConn` 的说明）。
+     */
+    const ENGINE_DEFAULTS: Record<string, Record<string, unknown>> = {
+      sqlite: { engine: 'sqlite', file: '', env: '', description: '', readOnly: true },
+      mysql: {
+        engine: 'mysql', host: '', port: undefined, user: '',
+        database: '', env: '', description: '', readOnly: true,
+      },
+      postgres: {
+        engine: 'postgres', host: '', port: undefined, user: '',
+        database: '', env: '', description: '', readOnly: true,
+      },
+    }
 
     // ── 渲染：一个连接 ────────────────────────────────────────────────────
 
@@ -337,7 +375,14 @@ window.__ModuleLoader__.load({
       const disabled = props.disabled
       const engine = typeof def.engine === 'string' && def.engine !== '' ? def.engine : 'sqlite'
 
-      const text = (key: string, labelKey: string, placeholder?: string) =>
+      /**
+       * 一个「标签 + 输入框」的字段。
+       *
+       * `placeholderKey` 是词条名，**省略就留空**。规则见词典那里的说明：
+       * 必填的给 `required`（「必填」），非必填的**留空**，只有留空有代价的
+       * （`env`）才另给一句。这不是校验（校验归建连侧的 `missingConnectionFields`）。
+       */
+      const text = (key: string, labelKey: string, placeholderKey?: string) =>
         react.createElement(
           'label',
           { key, style: FIELD },
@@ -347,7 +392,7 @@ window.__ModuleLoader__.load({
             type: 'text',
             autoComplete: 'off',
             value: def[key] == null ? '' : String(def[key]),
-            placeholder: placeholder ?? '',
+            placeholder: placeholderKey === undefined ? '' : t(placeholderKey),
             disabled,
             onChange: (e: any) => props.onEdit(key, e.target.value),
           }),
@@ -356,9 +401,9 @@ window.__ModuleLoader__.load({
       const fields: any[] = []
 
       if (engine === 'sqlite') {
-        fields.push(text('file', 'connFile', t('connFilePlaceholder')))
+        fields.push(text('file', 'connFile', 'required'))
       } else {
-        fields.push(text('host', 'connHost'))
+        fields.push(text('host', 'connHost', 'required'))
         // port 是数字：用 `inputMode="numeric"` 唤出数字键盘，**不做前端校验** ——
         // 填了字母就在提交时被 `Number()` 判成 `undefined`（= 不设），
         // 由建连侧的 `missingConnectionFields` 统一报"缺少 port"（见 editConn 的说明）。
@@ -372,6 +417,8 @@ window.__ModuleLoader__.load({
               type: 'text',
               inputMode: 'numeric',
               value: def.port == null ? '' : String(def.port),
+              // port 与 host 同属必填（`missingConnectionFields` 会拦），所以也标必填
+              placeholder: t('required'),
               disabled,
               onChange: (e: any) => props.onEdit('port', e.target.value),
             }),
@@ -395,7 +442,25 @@ window.__ModuleLoader__.load({
             }),
           ),
         )
-        fields.push(text('database', 'connDatabase'))
+        // `database` 的必填性**随引擎变**：postgres 必填、mysql 可选。
+        // 这种条件必填 schema 表达不了（见 config.ts 的 missingConnectionFields），
+        // 所以两边的 placeholder 文案不同 —— 必填说"必填"，mysql 则说明留空的影响。
+        fields.push(
+          react.createElement(
+            'label',
+            { key: 'database', style: FIELD },
+            react.createElement('span', { style: LABEL }, t('connDatabase')),
+            react.createElement('input', {
+              style: INPUT,
+              type: 'text',
+              autoComplete: 'off',
+              value: def.database == null ? '' : String(def.database),
+              placeholder: engine === 'postgres' ? t('required') : t('phDatabaseMysql'),
+              disabled,
+              onChange: (e: any) => props.onEdit('database', e.target.value),
+            }),
+          ),
+        )
       }
 
       return react.createElement(
@@ -404,16 +469,24 @@ window.__ModuleLoader__.load({
         react.createElement(
           'div',
           { style: ROW_HEAD },
-          react.createElement('input', {
-            style: { ...INPUT, flex: '0 0 220px', fontWeight: 600 },
-            value: name,
-            disabled,
-            placeholder: t('connNamePlaceholder'),
-            'aria-label': t('connName'),
-            // 改名 = 改 `name` 字段（深路径 op）—— 键是随机 id，不动，所以
-            // 同级的 `password` 原样留在宿主里（浏览器本来就拿不到它）。
-            onChange: (e: any) => props.onEdit('name', e.target.value),
-          }),
+          // ⚠ 名字框必须和引擎一样套在 `label > span + 控件` 里。
+          //   裸 input 比带 label 的兄弟矮一个标签的高度，而 ROW_HEAD 是 `alignItems: flex-end`
+          //   —— 不套的话名字框会跟「引擎」那两个字错开一截（曾经的"第一行不齐平"）。
+          react.createElement(
+            'label',
+            { style: { ...FIELD, flex: '0 0 220px' } },
+            react.createElement('span', { style: LABEL }, t('connName')),
+            react.createElement('input', {
+              style: { ...INPUT, fontWeight: 600 },
+              value: name,
+              disabled,
+              // 连接名必填（schema 的 `.required()`，也是工具入参的寻址方式）
+              placeholder: t('required'),
+              // 改名 = 改 `name` 字段（深路径 op）—— 键是随机 id，不动，所以
+              // 同级的 `password` 原样留在宿主里（浏览器本来就拿不到它）。
+              onChange: (e: any) => props.onEdit('name', e.target.value),
+            }),
+          ),
           react.createElement(
             'label',
             { style: { ...FIELD, flex: '0 0 140px' } },
@@ -421,7 +494,7 @@ window.__ModuleLoader__.load({
             react.createElement(
               'select',
               {
-                style: INPUT,
+                style: SELECT,
                 value: engine,
                 disabled,
                 onChange: (e: any) => props.onEdit('engine', e.target.value),
@@ -429,17 +502,32 @@ window.__ModuleLoader__.load({
               ENGINES.map((g) => react.createElement('option', { key: g, value: g }, g)),
             ),
           ),
-          // 只读开关：切引擎会让可用字段变，所以放头行（跟名字/引擎一行）
+          // 只读开关：切引擎会让可用字段变，所以放头行（跟名字/引擎一行）。
+          // 用官方 `Switch`（与 dsh-api-call 同款），不是原生 checkbox —— 原生那个
+          // 在这里只是个系统小方框，跟整页的观感对不上。
+          //
+          // ⚠ 语义是**反的**：开关"开" = 只读 = `readOnly: true`（fail-safe 那一侧）。
+          //   `def.readOnly !== false` 与 `isReadOnly()` 同一套判法 —— 缺省/非法值都
+          //   算只读，所以这里"开"的两个来源（true 与 undefined）表现一致。
+          //
+          // ⚠ 外面这层盒子**不是多余的**：`ROW_HEAD` 是 `alignItems: flex-end`，
+          //   而 `Switch` 比 input 矮（input 有 `minHeight: 30px`）。不套盒子的话
+          //   开关会贴着行底、跟名字/引擎的输入框错开一截。
+          //   盒子撑到与 input 等高，开关在里面垂直居中，三者的底边就齐了。
           react.createElement(
             'label',
-            { style: { ...CHECKBOX_ROW, flex: 'none' } },
-            react.createElement('input', {
-              type: 'checkbox',
-              checked: def.readOnly !== false,
-              disabled,
-              onChange: (e: any) => props.onEdit('readOnly', e.target.checked),
-            }),
-            t('connReadOnly'),
+            { style: { ...FIELD, flex: 'none' } },
+            react.createElement('span', { style: LABEL }, t('connReadOnly')),
+            react.createElement(
+              'span',
+              { style: SWITCH_BOX },
+              react.createElement(primitives.Switch, {
+                checked: def.readOnly !== false,
+                disabled,
+                label: t('connReadOnly'),
+                onChange: (v: boolean) => props.onEdit('readOnly', v),
+              }),
+            ),
           ),
           react.createElement(
             'button',
@@ -451,7 +539,7 @@ window.__ModuleLoader__.load({
         react.createElement(
           'div',
           { style: GRID },
-          text('env', 'connEnv', t('connEnvPlaceholder')),
+          text('env', 'connEnv', 'phEnv'),
           text('description', 'connDescription'),
         ),
       )
@@ -468,7 +556,8 @@ window.__ModuleLoader__.load({
           style: { ...INPUT, flex: '0 0 240px', fontWeight: 600 },
           value: props.def?.name ?? '',
           disabled: props.disabled,
-          placeholder: t('envNamePlaceholder'),
+          // 环境名必填（schema 的 `.required()`，也是 activeEnv / 连接的 env 的引用目标）
+          placeholder: t('required'),
           'aria-label': t('envName'),
           onChange: (e: any) => props.onEdit('name', e.target.value),
         }),
@@ -482,18 +571,81 @@ window.__ModuleLoader__.load({
 
     // ── 卡片 ──────────────────────────────────────────────────────────────
 
+    /**
+     * 由表单模型算出的卡片级状态 —— 与 dsh-api-call 的 `cardState` 同构。
+     *
+     * ⚠ `invalid` 必须**同时**看 `shell.invalid` 与逐字段的 `invalid`：
+     *   shell 的只说"有计划但某项没法转成写入"，而草稿里已经打错的数字落在
+     *   `field().invalid` 上；光看 shell 会让"填了字母"的输入框也能点保存。
+     */
+    /** 官方 `SettingsForm` 认的状态形状（与 dsh-api-call 的 `cardState` 同构）。 */
+    interface CardShellState {
+      available: boolean
+      writable: boolean
+      dirty: boolean
+      invalid: boolean
+      saving: boolean
+      failed: boolean
+    }
+
+    function cardState(shell: any, fields: any[]): CardShellState {
+      return {
+        available: shell.available,
+        writable: shell.writable,
+        dirty: shell.dirty,
+        invalid: shell.invalid || fields.some((f) => f.invalid),
+        saving: shell.saving,
+        failed: shell.failed,
+      }
+    }
+
+    function formLabels(t: (key: string) => string): Record<string, string> {
+      return {
+        save: t('save'),
+        saving: t('saving'),
+        saveFailed: t('saveFailed'),
+        unavailable: t('unavailable'),
+        readOnly: t('readOnly'),
+      }
+    }
+
     function apiCallCardFactory(api: any) {
       return function SqlConfigCard(props: any) {
         const t = props.t
         const state = props.useConfigCard((s: any) => s)
-        const disabled = !state.writable || state.saving
+
+        // 标量字段：逐字段取出来喂给 cardState（它要判 invalid）
+        const fields = ['activeEnv', 'maxRows'].map((key) => state.form[key] ?? {})
+        // `state.shell` 在 scope 未就绪时是那个全 false 的占位，形状一致。
+        const shell = cardState(state.shell ?? {}, fields)
+        // 字典草稿也算"脏"：用户可能只改了连接，没碰标量字段。
+        // ⚠ 这个 `dirty` 是给官方 `SettingsForm` 决定按钮变色的 —— 少了它，
+        //   改了连接也会显示成"没改动"，按钮不会亮。
+        const full = {
+          ...shell,
+          dirty: shell.dirty === true || state.dirty === true,
+        }
+        const disabled = full.writable !== true || full.saving === true
 
         return react.createElement(
-          'div',
-          null,
-          !state.writable
-            ? react.createElement('p', { style: P, role: 'status' }, t('readOnly'))
-            : null,
+          // ⚠ 外壳必须用官方的 `SettingsForm`，**不能自己画 `<div>` + 裸 `<button>`**。
+          //
+          //   官方的这个组件负责三件事，自绘版一件都做不了：
+          //     ① 画「保存 / 丢弃」按钮，并按 dirty / saving / failed 变色
+          //        （自绘的裸 button 只会 disabled，用户看不出"改了没保存"）
+          //     ② 把 onSave / onDiscard 接到官方状态机上
+          //     ③ 渲染 unavailable / readOnly 那两行提示
+          //
+          //   之前的 bug 就出在这里：自绘按钮没有正确的 dirty 语义，表现成
+          //   "保存按钮不变色"，而标量字段的改动经由官方模型直接落了盘 ——
+          //   "没点保存就生效"。这一层交给官方组件，两边就都不会发生了。
+          primitives.SettingsForm,
+          {
+            labels: formLabels(t),
+            state: full,
+            onSave: props.save,
+            onDiscard: props.discard,
+          },
 
           // 标量：走官方组件（`text`/`onEdit` 由 SettingsFormModel 提供）
           react.createElement(primitives.SettingsValueField, {
@@ -558,23 +710,8 @@ window.__ModuleLoader__.load({
             ),
             react.createElement('button', { type: 'button', style: BTN, disabled, onClick: props.addConn }, t('addConn')),
           ),
-
-          // 底部：保存
-          react.createElement(
-            'div',
-            { style: { display: 'flex', alignItems: 'center', gap: '12px', paddingTop: '12px' } },
-            react.createElement(
-              'button',
-              {
-                type: 'button',
-                style: BTN,
-                disabled: disabled || !state.dirty,
-                onClick: props.save,
-              },
-              state.saving ? t('saving') : t('save'),
-            ),
-            state.failed ? react.createElement('span', { style: { fontSize: '12px', color: '#e07a7a' } }, t('saveFailed')) : null,
-          ),
+          // 「保存 / 丢弃」由官方 `SettingsForm` 画（见上面的说明）——
+          // 这里**不要再自绘一个保存按钮**。
         )
       }
     }
@@ -719,14 +856,27 @@ window.__ModuleLoader__.load({
         })
       }
 
+      function discard() {
+        // 扔掉草稿 → 下次 sync 从宿主值重建（与 api-call 的 discard 同构）
+        envDraft = null
+        connDraft = null
+        passwordDraft = {}
+        syncDrafts()
+        refresh()
+        form.actions().discard()
+      }
+
       const actions = {
         edit: (field: string, text: string) => form.actions().edit(field, text),
         save,
+        discard,
 
+        // 新增一律**留空**，不预填任何名字 —— 预填的 `qa` / `main` 只是噪声：
+        // 用户还得先删掉它才能写自己要的，而忘了删就会存下一个假名字。
+        // 空名由 `name` 的 schema（`.required()`）在保存时拦下，不会静默入库。
         addEnv: () => {
-          envDraft = { ...(envDraft ?? {}) }
           const id = newId()
-          envDraft[id] = { name: uniqueName(envDraft, 'qa') }
+          envDraft = { ...(envDraft ?? {}), [id]: { name: '' } }
           refresh()
         },
         removeEnv: (id: string) => {
@@ -745,15 +895,19 @@ window.__ModuleLoader__.load({
         },
 
         addConn: () => {
-          const cur = { ...(connDraft ?? {}) }
           const id = newId()
-          // `name` 才是业务名（键是随机 id）。默认名避开已有的那些。
-          cur[id] = {
-            name: uniqueConnName(cur, 'main'),
-            engine: 'sqlite', file: '', port: undefined, user: '',
-            database: '', env: '', readOnly: true, description: '',
+          // `name` 才是业务名（键是随机 id）。**留空不预填** —— 理由同 addEnv。
+          //
+          // 其余字段按**该引擎用得到的**给（见 ENGINE_DEFAULTS）：字段集与
+          //   服务端 `connectionFieldKeys`（src/config.ts）对齐 —— 那份是
+          //   "这个引擎有哪些字段"的唯一真源，这里只是它的浏览器侧副本
+          //   （client 是独立 bundle，require 不到服务端模块，只能各写一份）。
+          // 值一律是"空/安全默认"，不编造连接信息：`readOnly: true` 与 fail-safe
+          //   一致，空串字段本来就等于没填。
+          connDraft = {
+            ...(connDraft ?? {}),
+            [id]: { name: '', ...ENGINE_DEFAULTS[DEFAULT_ENGINE] },
           }
-          connDraft = cur
           refresh()
         },
         removeConn: (id: string) => {

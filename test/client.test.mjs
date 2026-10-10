@@ -18,21 +18,67 @@ const reactStub = {
   },
 }
 
-/** `SettingsFormModel` 的替身 —— 按真实行为实现（含 `bind` 返回的 store 要有 `set`）。 */
+/**
+ * `SettingsFormModel` 的替身 —— **按真实实现的行为还原**。
+ *
+ * 对照的是 app.asar 里 `dsh-client-ui-primitives/lib/index.js` 的
+ * `SettingsFormModel`（约 7151-7360 行）。三件必须还原的事：
+ *
+ *   ① `edit()` **只 stage，绝不写盘**；`save()` 才是唯一的 `scope.mutate` 入口。
+ *   ② `shell().dirty` 看的是 `plan().length > 0`，不是"有没有草稿"——
+ *      文本改回原值后 plan 就空了，dirty 必须跟着变回 false。
+ *   ③ `save()` 用**暂存时快照的 revision** 做栅栏（真实实现是 `this.baseline?.revision`）。
+ *
+ * ⚠ 早先的 stub 把 `save()` 写成"只设个标记、根本不 mutate"，于是
+ *   "没点保存就不写盘"那条测试**在怎么错的代码上都是绿的** —— 它测不出任何东西。
+ *   替身不忠实，回归测试就是安慰剂。
+ */
 function primitivesStub() {
   return {
     SettingsValueField: 'SettingsValueField',
+    // 官方外壳：负责画「保存 / 丢弃」按钮并按 dirty 变色。
+    // 这里只留一个可辨识的标记 —— 渲染测试会断言它**在树里**（自绘外壳的回归防线）。
+    SettingsForm: 'SettingsForm',
+    // 只读开关用的官方组件。真实签名是 `{ checked, onChange, label, disabled }`，
+    // `onChange` 直接给**新值**（布尔），不是 event —— 测试里按这个形状断言。
+    Switch: 'Switch',
     SettingsFormModel: class {
-      constructor(scope) { this.scope = scope; this.listeners = new Set(); this.drafts = new Map() }
-      shell() {
-        const s = this.scope.getSnapshot()
-        if (s.status !== 'ready') throw new Error('shell() called before the scope is ready')
-        return { available: true, writable: true, dirty: this.drafts.size > 0, invalid: false, saving: false, failed: false }
+      constructor(scope) {
+        this.scope = scope
+        this.listeners = new Set()
+        this.staged = new Map()
+        this.baseline = undefined
+        this.saving = false
+        this.failed = false
       }
       field(name) {
-        if (this.drafts.has(name)) return { text: this.drafts.get(name), overridden: true, invalid: false }
+        const staged = this.staged.get(name)
+        if (staged !== undefined) return { text: staged.text, overridden: true, invalid: false }
         const v = this.scope.getSnapshot().value ?? {}
         return { text: v[name] === undefined ? '' : String(v[name]), overridden: false, invalid: false }
+      }
+      /** 真实实现：把暂存编成 ops，只对**真的变了**的字段产出 op。 */
+      plan() {
+        const plan = []
+        for (const [field, staged] of this.staged) {
+          const v = this.scope.getSnapshot().value ?? {}
+          const cur = v[field] === undefined ? '' : String(v[field])
+          if (staged.text === cur) continue // 改回原值 → 不产出 → dirty 也跟着变 false
+          plan.push({ field, op: { op: 'set', path: [field], value: staged.text } })
+        }
+        return plan
+      }
+      shell() {
+        const snapshot = this.scope.getSnapshot()
+        const plan = this.plan()
+        return {
+          available: snapshot.status === 'ready',
+          writable: snapshot.writable,
+          dirty: plan.length > 0,
+          invalid: false,
+          saving: this.saving,
+          failed: this.failed,
+        }
       }
       bind(project) {
         let current = project()
@@ -46,14 +92,43 @@ function primitivesStub() {
       actions() {
         const self = this
         return {
-          edit(field, text) { self.drafts.set(field, text); self.publish() },
-          resetField(field) { self.drafts.set(field, ''); self.publish() },
-          save() { self.saved = true },
-          discard() { self.drafts.clear(); self.publish() },
+          // ⚠ 只暂存，**不调 scope.mutate** —— 这是真实行为，也是本文件最重要的还原点
+          edit(field, text) { self.stage(field, { text }); self.publish() },
+          resetField(field) { self.stage(field, { text: '' }); self.publish() },
+          save() { return self.save() },
+          discard() { self.staged.clear(); self.baseline = undefined; self.failed = false; self.publish() },
+        }
+      }
+      stage(field, edit) {
+        this.baseline ??= this.scope.getSnapshot()
+        this.staged.set(field, edit)
+        this.failed = false
+        this.publish()
+      }
+      /** 真实实现：save() 里才 mutate，且用暂存时快照的 revision 当栅栏。 */
+      async save() {
+        const plan = this.plan()
+        if (!plan.length || this.saving || !this.scope.getSnapshot().writable) return
+        this.saving = true
+        this.failed = false
+        this.publish()
+        try {
+          const ops = plan.map((item) => item.op)
+          const landed = !ops.length || await this.scope.mutate(ops, this.baseline?.revision)
+          if (landed) {
+            this.staged.clear()
+            this.baseline = undefined
+          }
+          this.failed = !landed
+        } catch (_e) {
+          this.failed = true
+        } finally {
+          this.saving = false
+          this.publish()
         }
       }
       publish() { this.listeners.forEach((fn) => fn()) }
-      dispose() {}
+      dispose() { this.listeners.clear() }
     },
     settingsTextField: (field) => ({ field }),
     settingsNumberField: (field) => ({ field }),
@@ -83,7 +158,19 @@ function harness({ ready = true, writable = true, value = VALUE } = {}) {
       ? { status: 'ready', writable, revision: 7, value }
       : { status: 'loading', writable: false, revision: undefined, value: undefined }),
     subscribe: (fn) => { fn(); return () => {} },
-    mutate: async (ops, rev) => { mutations.push({ ops, rev }); return true },
+    /**
+     * 真实的 `mutate(ops, revision)` **带 revision 栅栏**：传了旧 revision 会被拒
+     * （返回 false），宿主就是这么防"读-改-写"撞车的。替身必须同样对待 ——
+     * 否则"两条路径各用各自基线"这类冲突在测试里永远不会暴露。
+     */
+    mutate: async (ops, rev) => {
+      if (rev !== undefined && rev !== 7) {
+        mutations.push({ ops, rev, rejected: true })
+        return false
+      }
+      mutations.push({ ops, rev })
+      return true
+    },
   }
 
   let registration = null
@@ -189,6 +276,66 @@ test('初始草稿来自宿主值', () => {
   assert.equal(snap.dirty, false, '什么都没改')
 })
 
+// ── 回归：编辑不得自动落盘、外壳必须是官方的 ───────────────────────────────
+
+test('回归：只编辑不点保存 → 绝不写盘', async () => {
+  const h = harness()
+  h.mod.apply(h.ctx)
+  const face = h.registration.o.inject()
+
+  // 字典草稿：改字段、加条目、删条目、输密码 —— 一个都不能自己落盘
+  face.editEnv('e2', 'name', 'production')
+  face.editConn('c1', 'host', '10.0.0.9')
+  face.editConn('c1', 'password', 'SECRET')
+  face.addConn()
+  face.removeConn('c2')
+  face.addEnv()
+  // 标量字段（走官方 SettingsFormModel 的暂存）
+  face.edit('activeEnv', 'prod')
+
+  await new Promise((r) => setTimeout(r, 10))
+  assert.deepEqual(h.mutations, [], '没点保存就写盘 = 用户改动被静默提交，这是数据安全问题')
+})
+
+test('回归：编辑后 dirty 变 true（保存按钮才会变色）', () => {
+  const h = harness()
+  h.mod.apply(h.ctx)
+  const face = h.registration.o.inject()
+  const card = face.hooks.configCard
+
+  assert.equal(card.getSnapshot().dirty, false, '初始不脏')
+
+  // 只改字典（不碰标量）也必须算脏 —— 早先这里漏了，按钮不会变色
+  face.editConn('c1', 'host', '10.0.0.9')
+  assert.equal(card.getSnapshot().dirty, true, '改连接字段后必须算脏')
+
+  // 草稿回到宿主值就该不脏
+  face.editConn('c1', 'host', VALUE.connections.c1.host)
+  assert.equal(card.getSnapshot().dirty, false, '改回原值后不算脏')
+})
+
+test('回归：外壳用官方 SettingsForm（自带保存/丢弃按钮与 dirty 变色）', () => {
+  const h = harness()
+  h.mod.apply(h.ctx)
+  const face = h.registration.o.inject()
+  const nodes = collect(deep(h.registration.component({ t: (k) => k, ...face }), face))
+
+  const shell = nodes.find((n) => n.type === 'SettingsForm')
+  assert.ok(shell, '必须用官方 SettingsForm 当外壳 —— 自绘的裸 button 没有 dirty 语义')
+  assert.equal(typeof shell.props.onSave, 'function', 'onSave 要交给官方组件')
+  assert.equal(typeof shell.props.onDiscard, 'function', 'onDiscard 要交给官方组件')
+  assert.ok(shell.props.state, 'state 要传进去，官方据此决定按钮变色')
+  assert.ok(shell.props.labels, 'labels 要传进去')
+
+  // 自绘的保存按钮必须已经删掉，否则又会出现"变了色也点不动/点得动却不变色"
+  const buttons = nodes.filter((n) => n.type === 'button')
+  assert.equal(
+    buttons.some((b) => String(b.children?.[0] ?? b.props?.children ?? '') === 'save'),
+    false,
+    '不能再自绘保存按钮',
+  )
+})
+
 test('保存：改环境名 / 连接字段 / 密码都发成深路径 op', async () => {
   const h = harness()
   h.mod.apply(h.ctx)
@@ -289,19 +436,29 @@ test('新增/删除条目', () => {
   h.mod.apply(h.ctx)
   const face = h.registration.o.inject()
 
-  // 新增：多出一个条目，且**不会**跟已有的撞名字 / 撞键
+  // 新增：多出一个条目，**不预填名字**（空名由 schema 的 .required() 在保存时拦下）
   face.addEnv()
   const withNewEnv = face.hooks.configCard.getSnapshot().envDraft
   assert.equal(Object.keys(withNewEnv).length, 3)
-  const names = Object.values(withNewEnv).map((e) => e.name)
-  assert.equal(new Set(names).size, names.length, '新环境的名字不能跟已有的重名')
+  const newEnvId = Object.keys(withNewEnv).find((k) => !['e1', 'e2'].includes(k))
+  assert.equal(withNewEnv[newEnvId]?.name, '', '新环境不预填名字')
 
   face.addConn()
   const withNewConn = face.hooks.configCard.getSnapshot().connDraft
   assert.equal(Object.keys(withNewConn).length, 4, '新连接的键不能跟已有的撞')
   const newId = Object.keys(withNewConn).find((k) => !['c1', 'c2', 'c3'].includes(k))
-  assert.equal(withNewConn[newId]?.engine, 'sqlite', '新连接默认 sqlite')
-  assert.equal(typeof withNewConn[newId]?.name, 'string', '新连接要有名字（键是 id）')
+  assert.equal(withNewConn[newId]?.engine, 'mysql', '新连接默认 mysql')
+  assert.equal(withNewConn[newId]?.name, '', '新连接不预填名字')
+  assert.equal(withNewConn[newId]?.readOnly, true, '新连接默认只读（与 fail-safe 一致）')
+  // 预置的字段必须**是 mysql 用得到的那些**（与服务端 connectionFieldKeys 对齐）：
+  // 有 host/port/database，**没有** sqlite 专用的 file
+  assert.equal(withNewConn[newId]?.host, '', 'mysql 要 host')
+  assert.equal(withNewConn[newId]?.port, undefined, 'port 留 undefined，好让服务端报"缺少 port"')
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(withNewConn[newId], 'file'),
+    false,
+    '不该预置 sqlite 专用的 file',
+  )
 
   // 删除：只删指定的那个
   face.removeEnv('e1')
@@ -311,4 +468,5 @@ test('新增/删除条目', () => {
   assert.equal(snap.envDraft.e2?.name, 'prod', 'e2 原样保留')
   assert.equal(snap.connDraft.c2, undefined, 'c2 被删掉')
   assert.deepEqual(Object.keys(snap.connDraft).sort(), [newId, 'c1', 'c3'].sort())
+  assert.equal(Object.keys(snap.envDraft).includes('e1'), false, 'e1 已删')
 })
