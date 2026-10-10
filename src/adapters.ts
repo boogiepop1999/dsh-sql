@@ -264,6 +264,24 @@ class SqliteAdapter implements DatabaseAdapter {
   }
 }
 
+/**
+ * 把配置里的 `port` 字符串转成驱动要的端口号。
+ *
+ * 配置里存的是**字符串**（设置页框里输入的原样值，见 config-schema.ts），
+ * 两个驱动都要数字。
+ *
+ *   `''` / 缺省  → `undefined` —— **交给驱动兜默认端口**（mysql2 → 3306、
+ *                  pg → 5432）。实测过：空值进去，驱动自己就走约定端口，
+ *                  所以这里不需要自己写一份"引擎 → 默认端口"的表。
+ *   别的         → `Number()`。**转不出来时原样交给驱动报错**（不在这里拦）：
+ *                  两个驱动的报错都带得上"端口"字样，而在这里拦就得多写一份
+ *                  规则、还得决定用什么措辞，不如让驱动说。
+ */
+function driverPort(port: string | undefined): number | undefined {
+  if (port === undefined || port === '') return undefined
+  return Number(port)
+}
+
 /** MySQL 适配器（mysql2 连接池）。 */
 class MysqlAdapter implements DatabaseAdapter {
   engine = 'mysql' as const
@@ -271,7 +289,7 @@ class MysqlAdapter implements DatabaseAdapter {
   constructor(connection: SqlConnectionConfig) {
     this.pool = mysql.createPool({
       host: connection.host,
-      port: connection.port,
+      port: driverPort(connection.port),
       user: connection.user,
       password: connection.password,
       database: connection.database,
@@ -353,7 +371,7 @@ class PostgresAdapter implements DatabaseAdapter {
   constructor(connection: SqlConnectionConfig) {
     this.pool = new pg.Pool({
       host: connection.host,
-      port: connection.port,
+      port: driverPort(connection.port),
       user: connection.user,
       password: connection.password,
       database: connection.database,

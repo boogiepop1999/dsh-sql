@@ -24,7 +24,13 @@ export interface SqlConnectionConfig {
   engine: 'sqlite' | 'mysql' | 'postgres'
   file?: string
   host?: string
-  port?: number
+  /**
+   * 端口 —— **字符串**，与 schema 一致（配置里写的就是设置页框里看到的）。
+   *
+   * 空串 = 不填，连接时按引擎走默认端口（驱动自己兜）。非空的要能转成数字，
+   * 转不出来的由建连时报错 —— 报错点只有这一个，带得上上下文。
+   */
+  port?: string
   user?: string
   password?: string
   database?: string
@@ -239,10 +245,13 @@ export function fillConnectionKeys(connection: SqlConnectionConfig): SqlConnecti
  * **建连侧（`createAdapter`）用这一份规则** —— 措辞由调用方拼，规则只此一处，
  * 两处各写一遍必然漂移（报错顺序都会不一致）。
  *
- * ⚠ **它管不了"保存时"**：条件是随 engine 变的（sqlite 要 file、mysql/pg 要 host+port、
+ * ⚠ **它管不了"保存时"**：条件是随 engine 变的（sqlite 要 file、mysql/pg 要 host、
  *   pg 还要 database），而 schemastery 的 schema 只能表达**单字段**的约束，
  *   表达不了"这个字段在那种情况下必填"。所以这一层只能在**建连时**判 ——
  *   报错会说清缺了哪几个字段，好过悄悄连到 localhost 或内存库上。
+ *
+ * **不查 `port`**：留空是合法值，连接时按引擎走默认端口（mysql 3306 /
+ * postgres 5432，驱动自己就兜）。它也不再是"必填"了。
  *
  * 不查 `user` / `password`：有的库确实不要密码。也不查 mysql 的 `database`：
  * 不指定默认库时可用全限定名查询。
@@ -254,7 +263,6 @@ export function missingConnectionFields(connection: SqlConnectionConfig): string
     return missing
   }
   if (connection.host === undefined || connection.host === '') missing.push('host')
-  if (connection.port === undefined) missing.push('port')
   if (connection.engine === 'postgres' && (connection.database === undefined || connection.database === '')) {
     missing.push('database')
   }

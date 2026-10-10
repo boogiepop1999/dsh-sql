@@ -337,6 +337,25 @@ window.__ModuleLoader__.load({
     const DEFAULT_ENGINE = 'mysql'
 
     /**
+     * 各引擎的默认端口 —— **只用于输入框的 placeholder**。
+     *
+     * 告诉用户"不填的话，连的时候会用这个"。除此之外前端**什么都不做**：
+     * 填什么存什么、不填就是空，空值原样提交。
+     *
+     * ⚠ 这里是**提示**，不是兜底逻辑。曾经想在前端补默认值（新建时预置、保存时
+     *   兜底、切引擎时同步……），每种都要处理"这条是新的还是已有的""这个值是不是
+     *   我们预置的"，越写越多。而**驱动自己就会兜**（实测 mysql2 空值走 3306、
+     *   pg 空值走 5432），前端再补一遍纯属重复。
+     *
+     * 所以端口这一格前端只有两件事：显示提示、原样提交。`ENGINE_DEFAULTS` 里
+     * port 预置成空串（= 框里留空），也见那里的说明。
+     */
+    const DEFAULT_PORT: Record<string, number> = {
+      mysql: 3306,
+      postgres: 5432,
+    }
+
+    /**
      * 新建连接时按引擎预置的字段（值一律"空 / 安全默认"）。
      *
      * ⚠ **必须与服务端 `connectionFieldKeys`（src/config.ts）的字段集对齐** ——
@@ -347,17 +366,19 @@ window.__ModuleLoader__.load({
      * 不预置别的引擎的字段：sqlite 用不到 `host`/`port`，硬塞进去只会在配置里
      * 留下一堆与这条连接无关的空键。
      *
-     * `port` 特意是 `undefined` 而不是 0：0 不是合法端口，留 `undefined` 才能让
-     * 服务端的 `missingConnectionFields` 明确报"缺少 port"（见 `editConn` 的说明）。
+     * `port` 预置成**空串**（= 框里留空）—— 端口在配置里是字符串，空串就是
+     * "没填"，连接时按引擎走默认端口。前端不预置默认端口：驱动自己就会兜
+     * （实测 mysql2 空值走 3306、pg 空值走 5432），这里再填一遍是重复。
+     * 界面上只把默认值写进 **placeholder** 告诉用户不填会用什么（见 DEFAULT_PORT）。
      */
     const ENGINE_DEFAULTS: Record<string, Record<string, unknown>> = {
       sqlite: { engine: 'sqlite', file: '', env: '', description: '', readOnly: true },
       mysql: {
-        engine: 'mysql', host: '', port: undefined, user: '',
+        engine: 'mysql', host: '', port: '', user: '',
         database: '', env: '', description: '', readOnly: true,
       },
       postgres: {
-        engine: 'postgres', host: '', port: undefined, user: '',
+        engine: 'postgres', host: '', port: '', user: '',
         database: '', env: '', description: '', readOnly: true,
       },
     }
@@ -412,7 +433,11 @@ window.__ModuleLoader__.load({
         fields.push(text('host', 'connHost', 'required'))
         // port 是数字：用 `inputMode="numeric"` 唤出数字键盘，**不做前端校验** ——
         // 填了字母就在提交时被 `Number()` 判成 `undefined`（= 不设），
-        // 由建连侧的 `missingConnectionFields` 统一报"缺少 port"（见 editConn 的说明）。
+        // 保存时再按引擎兜默认值（见 DEFAULT_PORT 与 dictOps 的说明）。
+        //
+        // placeholder 给**该引擎的约定端口**（3306 / 5432），不写"必填"：
+        //   留空即用默认值，所以"必填"是错的；而具体填什么，这个提示直接回答。
+        //   按当前 engine 现取，切引擎时提示跟着变（mysql ↔ postgres）。
         fields.push(
           react.createElement(
             'label',
@@ -423,8 +448,9 @@ window.__ModuleLoader__.load({
               type: 'text',
               inputMode: 'numeric',
               value: def.port == null ? '' : String(def.port),
-              // port 与 host 同属必填（`missingConnectionFields` 会拦），所以也标必填
-              placeholder: t('required'),
+              placeholder: DEFAULT_PORT[engine] === undefined
+                ? t('required')
+                : String(DEFAULT_PORT[engine]),
               disabled,
               onChange: (e: any) => props.onEdit('port', e.target.value),
             }),
@@ -946,20 +972,20 @@ window.__ModuleLoader__.load({
             refresh()
             return
           }
-          // port 从输入框来的是字符串，转成数字。
+          // port **原样进草稿，不做任何转换**。
           //
-          // ⚠ 空串与"转不出数字"都留 `undefined`（= 不设），**不能存 NaN**：
-          //   `Number('abc')` 是 NaN，而 `JSON.stringify({port:NaN})` 会写成 `null`
-          //   —— schema 的 `z.number()` 收下 `null`，于是配置里静默多出一个 `port: null`，
-          //   连库时才以"端口不对"的形式暴露，离原因很远。
-          //   留 undefined 的话，`missingConnectionFields` 会明确报"缺少 port"。
-          let v: unknown = value
-          if (key === 'port') {
-            const n = value === '' ? NaN : Number(value)
-            v = Number.isFinite(n) ? n : undefined
-          }
+          // 输入框是 `inputMode="numeric"`（唤数字键盘），正常路径只可能得到
+          // 数字或空串 —— 没有需要转换的形态。而一律原样留着，换来的是
+          // **只在一处**决定端口的值（保存时的 `withDefaultPort`），不在这里
+          // 埋一道会把空串和非法值揉成同一个 `undefined` 的转换。
+          //
+          // ⚠ 早先这里会把"空串"和"转不出数字"都转成 `undefined`，为的是让服务端
+          //   报「缺少 port」。现在 `port` 的 schema 已放开校验（见 config-schema.ts），
+          //   报错点统一到**建连时** —— 有上下文（哪个连接、连到哪）好排查。
           const next = { ...connDraft }
-          next[id] = { ...next[id], [key]: v }
+          next[id] = { ...next[id], [key]: value }
+          // 切引擎**不动 port**：留空的话保存时会按新引擎兜默认值（见 withDefaultPort），
+          // 用户填过的值则原样留着 —— 都不需要在这里改。
           connDraft = next
           refresh()
         },

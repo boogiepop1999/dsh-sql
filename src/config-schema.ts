@@ -100,9 +100,20 @@ export const ConnectionSchema = z.object({
   engine: z.string().required().description('sqlite / mysql / postgres'),
   file: z.string().default('').description('SQLite 数据库文件路径（engine=sqlite 时必填）'),
   host: z.string().default('').description('主机名（engine=mysql / postgres 时必填）'),
-  // 不标 .min(1)/.max(65535)：端口非法由建连时报错，而且 schema 只能表达单字段范围，
-  // 管不了"这个连接要不要端口"（sqlite 根本没有）。
-  port: z.number().description('端口'),
+  /**
+   * 端口。**字符串，不做数字校验。**
+   *
+   * 为什么是 string 而不是 number：界面是 `inputMode="numeric"` 的输入框，前端
+   * **原样提交**用户输入（填什么存什么、不填就是空串），那里不转数字 —— 一转就
+   * 多出一处会跟 schema 漂移的"端口规则"，而且空串转 `undefined` 之后连"用户
+   * 没填"这件事都看不出来了。配置里写的就是框里看到的。
+   *
+   * `''` 是**合法值**（= 不填）：连接时按引擎走默认端口（mysql 3306 / postgres
+   * 5432，驱动自己就兜）。所以这里不标 `.required()`，也不做范围校验 ——
+   * 端口写坏了的报错点在建连时，那里带得上上下文（哪个连接、连到哪），
+   * 比"保存时一句不知道哪错了"好排查（宿主校验失败只回一个布尔，前端拿不到详情）。
+   */
+  port: z.string().default('').description('端口；留空则按引擎默认（mysql 3306 / postgres 5432）'),
   user: z.string().default('').description('登录用户'),
   password: z.string().role('secret').default('').description('登录密码（只写，不回显）'),
   database: z.string().default('').description('数据库名（engine=postgres 时必填）'),

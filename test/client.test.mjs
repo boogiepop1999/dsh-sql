@@ -142,8 +142,8 @@ const VALUE = {
   // 键是**随机 id**，名字在条目的 `name` 上（跟环境同构）。改名只改 name 字段。
   connections: {
     c1: { name: 'polar', engine: 'sqlite', file: ':memory:', env: 'qa', readOnly: true, description: '本地' },
-    c2: { name: 'gp', engine: 'postgres', host: '10.0.0.2', port: 5432, user: 'ro', database: 'cg', env: 'prod', readOnly: true },
-    c3: { name: 'my', engine: 'mysql', host: '10.0.0.1', port: 3306, user: 'ro', database: 'app', env: 'qa', readOnly: false },
+    c2: { name: 'gp', engine: 'postgres', host: '10.0.0.2', port: '5432', user: 'ro', database: 'cg', env: 'prod', readOnly: true },
+    c3: { name: 'my', engine: 'mysql', host: '10.0.0.1', port: '3306', user: 'ro', database: 'app', env: 'qa', readOnly: false },
   },
 }
 
@@ -291,6 +291,31 @@ test('渲染出的值覆盖三种引擎各自的字段', () => {
   assert.ok(values.includes(':memory:'), 'sqlite 的 file')
   assert.ok(values.includes('10.0.0.2'), 'postgres 的 host')
   assert.ok(values.includes('3306'), 'mysql 的 port')
+})
+
+/**
+ * port 输入框的 placeholder = **该引擎的约定端口**（mysql 3306 / postgres 5432）。
+ *
+ * 这是"留空就用默认值"的**唯一提示**：框里是空的，用户凭什么知道不填会用 3306？
+ * 早先这里是 t('required')（"必填"）—— 现在留空是合法的，那句就错了。
+ *
+ * 按 engine 现取，所以切引擎时提示要跟着变。sqlite 没有端口，不给提示。
+ */
+test('port 的 placeholder 按引擎显示默认端口', () => {
+  const h = harness()
+  h.mod.apply(h.ctx)
+  const face = h.registration.o.inject()
+  const nodes = collect(deep(h.registration.component(cardProps(face)), face))
+
+  // 三个连接：c1 sqlite / c2 postgres / c3 mysql
+  const portInputs = nodes.filter(
+    (n) => n.type === 'input' && n.props.inputMode === 'numeric',
+  )
+  const byEngine = portInputs.map((n) => n.props.placeholder)
+  assert.ok(byEngine.includes('3306'), 'mysql 的 port 提示 3306')
+  assert.ok(byEngine.includes('5432'), 'postgres 的 port 提示 5432')
+  assert.equal(byEngine.includes('required'), false, '留空合法，不该再提示"必填"')
+  assert.equal(portInputs.length, 2, 'sqlite 没有端口，只有 mysql/pg 各一个')
 })
 
 // ── 草稿与保存 ─────────────────────────────────────────────────────────────
@@ -446,32 +471,51 @@ test('保存：改名连接只改 name 字段，**不动键**（否则密码会�
   assert.equal(ops.some((o) => o.path.length === 2), false, '不该整条重写 —— 那会把 password 冲成空串')
 })
 
-test('保存：port 填了非数字不写 NaN/null，当作"没设"', async () => {
-  // port 输入框是 `type="text"`（只是唤数字键盘，不做前端校验），所以用户能填进字母。
-  // 若原样 `Number()` 存进草稿，`JSON.stringify({port:NaN})` 会写成 `null` ——
-  // schema 的 `z.number()` 收下它，配置里就静默多一个 `port: null`，连库时才报错。
+/**
+ * 端口这一格前端**什么都不做**：填什么存什么、不填就是空。
+ *
+ * 曾经想在前端补默认值（新建时预置、保存时兜底、切引擎时同步……），每种都要
+ * 处理"这条是新的还是已有的""这个值是不是我们预置的"。而**驱动自己就会兜**：
+ * 实测 mysql2 空值走 3306、pg 空值走 5432。前端再补一遍是重复劳动，还多一处
+ * 会跟 schema 漂移的规则。
+ *
+ * 所以这里断言的是"**原样**"：不转换、不补值、不看引擎。
+ */
+test('保存：port 原样进 op，前端不转换也不补值', async () => {
+  // 填数字 → 原样（不做 Number 转换，'3307' 就是 '3307'）
   const h = harness()
   h.mod.apply(h.ctx)
   const face = h.registration.o.inject()
-
-  face.editConn('c3', 'port', 'abc')
+  face.editConn('c3', 'port', '3307')
   face.save()
   await new Promise((r) => setTimeout(r, 5))
-
-  const ops = h.mutations[0]?.ops ?? []
-  const portOp = ops.find((o) => o.path[1] === 'c3' && o.path[2] === 'port')
+  const portOp = (h.mutations[0]?.ops ?? []).find((o) => o.path[1] === 'c3' && o.path[2] === 'port')
   assert.ok(portOp, 'port 变了就该发 op')
-  assert.equal(portOp.value, undefined, '非法输入当作"没设"，不能是 NaN / null')
+  assert.equal(portOp.value, '3307', '原样提交')
 
-  // 合法数字照常转
+  // 清空 → 也是原样（空串就是空串，**不补 3306**）
   const h2 = harness()
   h2.mod.apply(h2.ctx)
   const face2 = h2.registration.o.inject()
-  face2.editConn('c3', 'port', '1234')
+  face2.editConn('c3', 'port', '')
   face2.save()
   await new Promise((r) => setTimeout(r, 5))
   const portOp2 = (h2.mutations[0]?.ops ?? []).find((o) => o.path[1] === 'c3' && o.path[2] === 'port')
-  assert.equal(portOp2.value, 1234)
+  assert.equal(portOp2.value, '', '空就存空 —— 交给驱动兜，前端不补')
+
+  // 新建连接、port 留空 → 整条写入里 port 是**空串**（= 没填），不预置默认端口。
+  // 空值由驱动兜（mysql2 → 3306、pg → 5432），前端不重复这件事。
+  const h3 = harness()
+  h3.mod.apply(h3.ctx)
+  const face3 = h3.registration.o.inject()
+  face3.addConn()
+  const newId = Object.keys(face3.hooks.configCard.getSnapshot().connDraft)
+    .find((k) => !['c1', 'c2', 'c3'].includes(k))
+  face3.editConn(newId, 'host', '10.0.0.9')
+  face3.save()
+  await new Promise((r) => setTimeout(r, 5))
+  const addOp = (h3.mutations[0]?.ops ?? []).find((o) => o.op === 'set' && o.path[1] === newId)
+  assert.equal(addOp.value.port, '', '空着就是空串，不预置默认端口')
 })
 
 test('保存：什么都没改就不写入', async () => {
@@ -504,7 +548,9 @@ test('新增/删除条目', () => {
   // 预置的字段必须**是 mysql 用得到的那些**（与服务端 connectionFieldKeys 对齐）：
   // 有 host/port/database，**没有** sqlite 专用的 file
   assert.equal(withNewConn[newId]?.host, '', 'mysql 要 host')
-  assert.equal(withNewConn[newId]?.port, undefined, 'port 留 undefined，好让服务端报"缺少 port"')
+  // port 预置成**空串**（= 框里留空）。默认端口不预置进配置 —— 连接时驱动自己兜
+  // （mysql2 → 3306、pg → 5432），界面上只用 placeholder 告知，见 DEFAULT_PORT。
+  assert.equal(withNewConn[newId]?.port, '', '不预置默认端口，留空串')
   assert.equal(
     Object.prototype.hasOwnProperty.call(withNewConn[newId], 'file'),
     false,
