@@ -26,15 +26,21 @@
  *        │  读：scope.getSnapshot().value / .revision / .writable
  *        └── 写：scope.mutate(ops, revision) → 宿主校验 → 原子写 patch → Loader 热重载
  *
- * ## 与 dsh-api-call 的两处不同
+ * ## 两个字典**同构**：随机 id 为键，`name` 才是业务名
  *
- * ① **`environments` 是「随机 id → { name }」的字典**（跟 api-call 同构），所以环境
- *    条目本身用深路径 op 增删改；但条目里**只有 name**（SQL 的环境没有地址之类的属性）。
+ * `environments` 与 `connections` 都是「随机 id → 条目」的字典（与 dsh-api-call 的
+ * `environments` / `users` 同构）。用户看不到也改不了 id；业务上引用条目一律用条目里
+ * 的 `name`（工具调用的 `connection` 参数、`activeEnv`、连接的 `env` 都认名字）。
  *
- * ② **`connections` 是「连接名 → 连接定义」的字典，键就是业务上的名字** ——
- *    跟 api-call 的 `users` 不同（那边键是随机 id）。所以这里**改名 = 删旧键 + 加新键**，
- *    要在一个 revision 栅栏下原子提交；而字段编辑只发改过的那个字段（深路径），
- *    这样同级的 `password` 不会被整组写回抹掉。
+ * 于是**改名只是改 `name` 字段**（一条深路径 op），不碰同级其它字段。
+ *
+ * ⚠ 键**不能**是业务名。曾经 `connections` 拿连接名当键，改名只能"删旧键 + 加新键"，
+ *   而新键走的是"新增整条"——浏览器拿不到已存的密码（宿主跨线前脱敏），那条 op 里的
+ *   `password` 只能是空串，于是**改一次名就把密码清空**。键与名字解耦之后，同级的
+ *   `password` 原样留在宿主里。
+ *
+ * 两处差异只在**条目里有什么字段**：SQL 的环境只有 `name`（连接地址在连接自己身上），
+ * api-call 的环境还带 `baseUrl` / `allowInsecure`。
  *
  * ## 为什么连接不能用 `SettingsFormModel`
  *
@@ -841,8 +847,8 @@ window.__ModuleLoader__.load({
       function save() {
         const ops: any[] = []
         if (envDraft) ops.push(...dictOps(baseline.environments, envDraft, 'environments'))
-        // ⚠ 连接：**先删后改**由 ops 顺序保证不了，所以改名是"原子一批"提交 ——
-        //   删旧键 + 加新键在同一个 revision 栅栏下，不会留中间态。
+        // 连接与环境编 ops 的规则是同一套（`dictOps`）—— 键都是随机 id，所以改名
+        // 也只是改 `name` 字段，不存在"删旧键 + 加新键"。
         if (connDraft) ops.push(...dictOps(baseline.connections, connDraft, 'connections'))
         for (const name of Object.keys(passwordDraft)) {
           if (!passwordDraft[name]) continue

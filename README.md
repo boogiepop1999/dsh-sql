@@ -4,7 +4,7 @@
 
 > **你的 agent 会查库了**：SQLite / MySQL / PostgreSQL 三引擎，只读白名单 + 连接级写开关 + 按环境筛选。**改配置不用重启。**
 
-DSH（DeepSeek Harness）数据库插件：九个工具覆盖环境与连接管理、只读查询、写操作、结构探查、统计概览与探活自检。
+DSH（DeepSeek Harness）数据库插件：七个工具覆盖环境切换、只读查询、写操作、结构探查、统计概览与探活自检，配置报告兼作排查入口。
 
 ![npm version](https://img.shields.io/npm/v/dsh-sql?label=npm&color=blue) ![npm downloads](https://img.shields.io/npm/dm/dsh-sql) ![license](https://img.shields.io/npm/l/dsh-sql) ![stars](https://img.shields.io/github/stars/STARDUSTLC666/dsh-sql?style=social)
 
@@ -25,7 +25,8 @@ dsh plugin --profile web remove dsh-sql   # 卸载
 配置落在**当前 profile 的 `cordis.patch.yml`**（`id: sql` 的 `config` 段），
 由 DSH 的 settings 服务托管：带 schema 校验、草稿与保存两段式、写入失败回滚。
 
-第一次调用任何工具时会自动生成出厂配置（**空的，需要自己配连接**）：
+**字段全缺时不必手写** —— schema 里有 `.default()`，缺的字段由宿主按出厂值补上，
+所以只写自己关心的那几项就行。最小可用的一份配置（**空的，需要自己配连接**）：
 
 ```yaml
 - id: sql
@@ -33,7 +34,7 @@ dsh plugin --profile web remove dsh-sql   # 卸载
     activeEnv: ""            # 当前环境；空 = 只有不限环境的连接可见
     maxRows: 1000            # 查询返回行数上限（1-10000）
     environments: {}         # 环境清单：随机 id → { name }
-    connections: {}          # 连接清单：连接名 → { ... }
+    connections: {}          # 连接清单：随机 id → { name, engine, ... }
 ```
 
 配好之后大致长这样：
@@ -48,8 +49,9 @@ dsh plugin --profile web remove dsh-sql   # 卸载
         name: qa
       2a67a891:
         name: prod
-    connections:
-      polar:                 # 键即连接名
+    connections:             # ⚠ 键同样是**随机 id**（见下方说明）
+      b1d4f7a2:
+        name: polar          # ← 连接名在这里，工具调用的 connection 参数认它
         engine: mysql        # sqlite / mysql / postgres
         host: 10.0.0.1
         port: 3306           # mysql / postgres 必填，没有默认值
@@ -59,7 +61,8 @@ dsh plugin --profile web remove dsh-sql   # 卸载
         env: qa              # 所属环境（写**名字**，不是 id）
         readOnly: false      # 显式开写 —— 不写这个字段就是只读
         description: QA 主库
-      gp-pro:
+      5e8c0a31:
+        name: gp-pro
         engine: postgres
         host: 10.0.0.2
         port: 5432
@@ -71,9 +74,13 @@ dsh plugin --profile web remove dsh-sql   # 卸载
         description: 生产 GP，慎写
 ```
 
-> **`environments` 的键是随机 id，不是名字。** id 由设置页生成，用户看不到也改不了；
+> **两个清单的键都是随机 id，不是名字。** id 由设置页生成，用户看不到也改不了；
 > 显示名是条目里的 `name` 字段。`activeEnv` 和连接的 `env` 存的都是**名字**。
-> 这个形状让设置页能用深路径 op 增删改单个环境 —— 见 `src/config-schema.ts` 的说明。
+>
+> 连接这条尤其要紧：**键与名字必须解耦**。若拿连接名当键，改名就只能"删旧键 + 加新键"，
+> 而新键走的是"新增整条"——浏览器拿不到已存的密码（宿主跨线前脱敏），那条 op 里的
+> `password` 只能是空串，于是**改一次名就把密码清空**。键是 id 时改名只是改 `name` 字段，
+> 同级的 `password` 原样留在宿主里。详见 `src/config-schema.ts` 的说明。
 
 > `readOnly` 不写就是**只读**。上例的 `polar` 显式给了 `false`，因为 QA 连接要能写。
 
@@ -85,7 +92,6 @@ dsh plugin --profile web remove dsh-sql   # 卸载
 **`environments` 是连接的分组标签，`activeEnv` 决定 `sql_settings` 和 `sql_health` 里哪些连接可见。**
 
 匹配规则只有一条：**`env` 为空的连接在任何环境都可见**，否则要求 `env === activeEnv`；没匹配上的一律算「其它环境」。
-
 - **清单本身**：`environments` 是「随机 id → `{ name }`」的字典；业务上引用环境一律用
   `name`（`activeEnv` 和连接的 `env` 存的都是名字）
 - **`activeEnv` 与连接的 `env` 都应当命中某个环境的 `name`** —— 这条是**跨字段**规则，
@@ -121,10 +127,12 @@ dsh plugin --profile web remove dsh-sql   # 卸载
 
 ### 连接字段
 
-**`connections` 是以连接名为键的对象**（键区分大小写）。
+**`connections` 是「随机 id → 连接定义」的对象**；连接名是条目里的 `name` 字段，
+不是键（键是 id）。工具调用的 `connection` 参数认的是 **`name`，且区分大小写**。
 
 | 字段 | 引擎 | 说明 |
 | :-- | :-- | :-- |
+| `name` | 全部 | **连接名（业务名）**，必填。工具调用的 `connection` 参数、报告里显示的都是它 |
 | `engine` | 全部 | `sqlite` / `mysql` / `postgres`。**新建时必填；已有连接不可改** —— 要换引擎请删掉重建 |
 | `file` | sqlite | **必填**：数据库文件路径，如 `:memory:` |
 | `host` / `port` | mysql / postgres | **必填**；无默认值，不填会在写入与建连时报错。`port` 须为正整数 |
@@ -157,7 +165,7 @@ dsh plugin --profile web remove dsh-sql   # 卸载
 | `sql_stats` | 表数量、行数与库体积概览 | 表名引用 + 查询失败隔离 |
 | `sql_health` | 逐连接探活（并发） | 不回显密码 |
 
-> `connection` 是**必填**参数，值就是 `connections` 里的键（连接名）—— 多库协作没有「当前库」概念，一律显式指定。
+> `connection` 是**必填**参数，值就是连接的 `name`（不是它在配置里的键 id）—— 多库协作没有「当前库」概念，一律显式指定。
 >
 > **配置编辑在插件设置页**，工具里只剩 `sql_env_use` 一个写操作 —— 切环境是"每次任务都可能
 > 用到"的常规动作，跟"改连接 / 加环境"不是一类事。它带「仅当用户明确要求时才调用」的约定。

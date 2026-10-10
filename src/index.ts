@@ -32,6 +32,14 @@ export const inject = ['tools']
 export interface SqlPluginContext {
   tools: { register(definition: SqlToolDefinition): () => void }
   on(event: 'dispose', listener: () => void): () => void
+  /**
+   * **本插件的 fiber**（Cordis 给每个 plugin 实例建的那个）。
+   *
+   * ⚠ 这个字段必须在**顶层**接口上 —— 它要传给 `settings.configure` 的 owner，
+   *   而那个 owner 只能是**本插件自己的** fiber（见 `apply` 里的说明）。
+   *   子级 ctx 也继承它（同一个插件实例只有一个 fiber）。
+   */
+  fiber?: unknown
   /** settings 服务不是硬依赖 —— 用 `inject` 子级按需挂载（见 apply）。 */
   inject(deps: string[], callback: (ctx: SqlSettingsContext) => void): unknown
 }
@@ -42,7 +50,6 @@ export interface SqlSettingsContext extends SqlPluginContext {
     configure?(presentation: { auto: boolean }, owner?: unknown): void
     update?(ns: string, patch: Record<string, unknown>): Promise<unknown>
   }
-  fiber?: unknown
   effect?(callback: () => unknown, label?: string): unknown
 }
 
@@ -99,6 +106,10 @@ function readConfigValue(config: unknown): unknown {
  */
 export function apply(ctx: SqlPluginContext, config?: unknown): void {
   const getConfig = configReader(config)
+  // **本插件的 fiber** —— `settings.configure` 的 owner 只能是它（见下面 inject 里的说明）。
+  // 必须在 `apply` 里取一次存住：`ctx.inject` 回调里的 `settingsCtx.fiber` 是**子插件**的
+  // fiber，不是这个。
+  const selfFiber = ctx.fiber
 
   const { tools, adapters } = buildSqlTools(getConfig)
   const allTools = [...buildSettingsTools(getConfig), ...tools]
@@ -121,8 +132,22 @@ export function apply(ctx: SqlPluginContext, config?: unknown): void {
   //   交给 Cordis 比我们自己记账可靠（`sql_env_use` 的回调可能晚于 `apply` 末尾那行
   //   `ctx.on('dispose', …)`，那时 `disposers` 已经被清空）。
   ctx.inject(['settings'], (settingsCtx) => {
+    // `configure` 的第二个参数（owner）**必须显式传本插件的 fiber**，省略是错的。
+    //
+    //   owner 默认值是 `this.ctx.fiber`，而 `this.ctx` 会在调用点被重绑到**当前** ctx
+    //   （dsh-settings 的 `Service` 带 `property: "ctx"` 的 tracker，见 cordis 的
+    //   `createTraceable`）。所以我们这里省略时拿到的是 **`settingsCtx`（子插件）的
+    //   fiber**，不是本插件的。
+    //
+    //   而 `dsh-settings` 判「要不要自动生成表单」时查的是**被渲染的那个插件条目**的
+    //   fiber：`this.presentations.get(entry.fiber)?.auto ?? true`。子 fiber 查不到，
+    //   于是回落 `true` —— `auto: false` 静默失效。实测：省略 = true，传父 fiber = false。
+    //
+    // ⚠ 重复注册同一个 owner 会抛 `Settings presentation is already configured`，
+    //   但这里安全：`effect` 的 disposer 会先注销旧策略（`configure` 返回的正是那个
+    //   disposer，由 `effect` 负责调用），子级重建时不会残留。
     settingsCtx.effect?.(
-      () => settingsCtx.settings?.configure?.({ auto: false }),
+      () => settingsCtx.settings?.configure?.({ auto: false }, selfFiber),
       'sql: settings presentation',
     )
 

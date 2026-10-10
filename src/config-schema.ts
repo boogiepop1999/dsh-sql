@@ -123,7 +123,7 @@ export const ConfigSchema: Schema = z.object({
   environments: z.dict(EnvironmentSchema).default({})
     .description('环境清单：随机 id → { name }'),
   connections: z.dict(ConnectionSchema).default({})
-    .description('连接清单：连接名 → { engine, host, ... }'),
+    .description('连接清单：随机 id → { name, engine, ... }（键是 id，不是连接名）'),
 }).volatile()
 
 /**
