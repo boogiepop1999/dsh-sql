@@ -6,7 +6,7 @@
  * @module dsh-sql/tools
  */
 import { defineTool, type AuthorSchema } from '@deepseek-ai/dsh-tools'
-import { createAdapter, type DatabaseAdapter } from './adapters.js'
+import { createAdapter, ConnectionBrokenError, isConnectionError, type DatabaseAdapter } from './adapters.js'
 import { type SqlSettings, type SqlConnectionConfig, findConnectionByName, isReadOnly, requireMaxRows, passwordEnvName, splitConnectionsByEnv, QUERY_TIMEOUT_MS, EXEC_TIMEOUT_MS, STATS_TIMEOUT_MS } from './config.js'
 import { countStatements, splitStatements, stripSqlNoise } from './sql-lex.js'
 import {
@@ -74,6 +74,8 @@ const execSchema: AuthorSchema = {
   properties: {
     connection: { type: 'string' },
     changes: { type: 'integer' },
+    failed: { type: 'boolean' },
+    report: { type: 'string' },
   },
   additionalProperties: true,
 }
@@ -168,7 +170,7 @@ const healthSchema: AuthorSchema = {
       type: 'array',
       items: {
         type: 'object',
-        properties: { name: { type: 'string' }, ok: { type: 'boolean' }, error: { type: 'string' } },
+        properties: { name: { type: 'string' }, ok: { type: 'boolean' }, error: { type: 'string' }, broken: { type: 'boolean' } },
         additionalProperties: true,
       },
     },
@@ -208,6 +210,33 @@ function connectionFingerprint(connection: NamedSqlConnection): string {
  * 自造的 `parameters` 是手写 JSON Schema，宿主不会校验它。
  */
 type SqlToolDefinition = ReturnType<typeof defineTool>
+
+/**
+ * 把「连接异常」整理成给模型看的那段文案。
+ *
+ * 两个来源统一收口到 `ConnectionBrokenError`：
+ *   ① 适配器已经标记 broken（`adapterFor` 直接抛），② 本次调用里驱动报的连接类错误。
+ *
+ * 文案里**必须**同时包含「连接异常」和「请勿重试」—— 前者让模型知道性质，
+ * 后者是用户明确要求的行为约束：数据库挂了就别再打。
+ */
+function connectionBrokenReport(label: string, connection: string, error: unknown): string {
+  // 适配器在 broken 状态下抛的已经带完整文案，加个前缀即可。
+  const body = error instanceof ConnectionBrokenError
+    ? error.message
+    : new ConnectionBrokenError(
+      connection,
+      error instanceof Error ? error.message : String(error),
+      new Date().toISOString(),
+    ).message
+  // 注意：**不要往文案里加"可以重试 / 稍后再试"** —— 用户要求数据库挂了就不重试。
+  return '⚠ ' + label + ' 未成功执行。\n\n' + body
+}
+
+/** 是否属于「连接已不可用」，需要走「不重试」的返回路径。 */
+function isBrokenFailure(error: unknown): boolean {
+  return error instanceof ConnectionBrokenError || isConnectionError(error)
+}
 
 /** 构建工具定义；配置**每次调用现读**，adapters 按连接名缓存并按指纹失效。 */
 export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDefinition[]; adapters: ReadonlyMap<string, DatabaseAdapter> } {
@@ -262,6 +291,17 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
     const fingerprint = connectionFingerprint(connection)
     const cached = cache.get(connection.name)
     if (cached !== undefined) {
+      // 连接被标记 broken → **直接拒绝，不重连、不重试、不重建池**。
+      //
+      // 用户明确要求：数据库挂了就别自动重连（连上了也大概率是死的），
+      // 更不要在同一次任务里反复打。恢复靠「改连接配置」或「重启插件」这两条手动路径。
+      //
+      // ⚠ 放在指纹判断**之前**：即便配置没变也要拦，否则会掉进下面的"重建新池"分支，
+      //   等于变相自动重连。
+      const health = cached.adapter.health()
+      if (health.state === 'broken') {
+        throw new ConnectionBrokenError(connection.name, health.reason, health.at)
+      }
       if (cached.fingerprint === fingerprint) return cached.adapter
       // 定义变了：旧池不再代表这个连接，关掉它再建新的。
       // 失败不影响新池可用（旧连接可能已经断了），所以不 await、只报不抛。
@@ -278,6 +318,44 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
     return { adapter: adapterFor(connection), name: connection.name, connection }
   }
 
+  /**
+   * **显式重连**（只由 `sql_health` 的 `reset` 参数触发）。
+   *
+   * 为什么不复用 `adapterFor`：那个函数在 broken 时是**故意抛错**的（不自动重连）。
+   * 这里是用户/模型明确要求「重连一次」的路径，所以绕开缓存直接重建。
+   *
+   * 语义仍然是**一次**，不是重试循环：
+   *   ① 关掉旧池（含 broken 的）→ ② 建新适配器 → ③ 清标记 → ④ ping 一次
+   *   ⑤ ping 失败就让新适配器自己标回 broken（驱动层已做），错误原样交回，不再二次重建。
+   */
+  const forceReconnect = async (name: string | undefined, signal?: AbortSignal): Promise<{ name: string; ok: boolean; reconnected: boolean; error: string }> => {
+    const connection = resolveConnection(name)
+    signal?.throwIfAborted()
+    const previous = cache.get(connection.name)
+    // 先摘缓存，避免关旧池期间有并发调用又摸到那条已经毁掉的连接。
+    cache.delete(connection.name)
+    if (previous !== undefined) {
+      try {
+        await previous.adapter.close()
+      } catch {
+        // 旧池多半早就跟着连接一起死了，关不掉不影响重建。
+      }
+    }
+    const adapter = createAdapter(connection)
+    // 新适配器本来就是 ok 状态；这行是显式声明「标记已清空」，别让后来的人以为要靠它自动恢复。
+    adapter.markHealthy()
+    cache.set(connection.name, { adapter, fingerprint: connectionFingerprint(connection) })
+    adapters.set(connection.name, adapter)
+    try {
+      await adapter.ping(signal)
+      return { name: connection.name, ok: true, reconnected: true, error: '' }
+    } catch (error) {
+      signal?.throwIfAborted()
+      // 重连后的第一次 ping 就失败 → 不重试，直接如实返回（新适配器的 health 已被驱动层标回 broken）。
+      return { name: connection.name, ok: false, reconnected: true, error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
   /** 逐连接并发探活：串行下 N 个不通要等 N 次超时，并发只等最慢的一个。只探在 activeEnv 下可见的连接。 */
   const pingAllConnections = async (signal?: AbortSignal): Promise<Array<Record<string, unknown>>> => {
     const cfg = loadConfig()
@@ -291,7 +369,10 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
       } catch (error) {
         signal?.throwIfAborted()
         entry.ok = false
+        // broken 的连接不会真的发出 SELECT 1（adapterFor 直接抛）——
+        // 这正是不自动重连的意思：探活不去打已经挂掉的库。
         entry.error = error instanceof Error ? error.message : String(error)
+        if (error instanceof ConnectionBrokenError) entry.broken = true
       }
       return entry
     }))
@@ -309,6 +390,8 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
       schema: querySchema,
       render: (_args, value) => {
         const rec = asRecord(value)
+        // 连接异常：直接输出那段「连接异常 / 请勿重试」的文案。
+        if (typeof rec.report === 'string' && rec.report !== '') return [{ type: 'text', text: rec.report }]
         if (typeof rec.formatted === 'string' && rec.formatted !== '') {
           const preview = rec.formatted.length > 4000 ? rec.formatted.slice(0, 4000) + '\n…（预览已截断）' : rec.formatted
           return [{ type: 'text', text: '查询返回 ' + rec.rowCount + ' 行（' + String(rec.format) + ' 格式）：\n' + preview }]
@@ -330,6 +413,10 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
       try {
         result = await adapter.query(sql, maxRows + 1, executionSignal(exec))
       } catch (error) {
+        // 连接异常：**正常返回「连接异常 + 请勿重试」**，不抛出、不重试。
+        if (isBrokenFailure(error)) {
+          return { connection: name, columns: [], rows: [], rowCount: 0, truncated: false, maxRows, failed: true, report: connectionBrokenReport('sql_query', name, error) }
+        }
         // 超时按「撤销用户的取消」处理：只有非取消的中止才换成指导性文案。
         if (isAbortError(error) && executionSignal(exec)?.aborted !== true) {
           throw queryTimeoutError(QUERY_TIMEOUT_MS / 1000, sql)
@@ -371,6 +458,8 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
       schema: execSchema,
       render: (_args, value) => {
         const rec = asRecord(value)
+        // 连接异常不走抛出，而是作为**正常返回**里的一段文案 —— 见 execute 里的说明。
+        if (typeof rec.report === 'string' && rec.report !== '') return [{ type: 'text', text: rec.report }]
         return [{ type: 'text', text: '执行完成（' + rec.connection + '）：影响 ' + rec.changes + ' 行。' }]
       },
     },
@@ -389,8 +478,16 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
       }
       let changes: number
       try {
+        // 连接已被标记 broken 时，adapterFor 会抛 ConnectionBrokenError（不重建池、不重试）。
         changes = await adapterFor(connection).exec(sql, executionSignal(exec))
       } catch (error) {
+        // 连接异常：**用正常返回把「连接异常 + 请勿重试」交给模型**，而不是抛出去。
+        //
+        // 抛出去时宿主给的是一段异常栈，模型看到的只是"出错了"，很容易自己再调一轮 ——
+        // 而用户明确要求：数据库已经挂了就别重试。作为返回值文案，指令才能稳稳传达到。
+        if (isBrokenFailure(error)) {
+          return { connection: connection.name, changes: 0, failed: true, report: connectionBrokenReport('sql_exec', connection.name, error) }
+        }
         if (isAbortError(error) && executionSignal(exec)?.aborted !== true) {
           throw execTimeoutError(EXEC_TIMEOUT_MS / 1000, sql)
         }
@@ -412,6 +509,7 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
       schema: schemaToolSchema,
       render: (_args, value) => {
         const rec = asRecord(value)
+        if (typeof rec.report === 'string' && rec.report !== '') return [{ type: 'text', text: rec.report }]
         const columns = Array.isArray(rec.columns) ? rec.columns : []
         if (columns.length > 0) {
           const lines = ['表 ' + rec.table + ' 的列：']
@@ -436,14 +534,21 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
       const { adapter, name } = getAdapter(optionalString(args, 'connection'))
       const table = optionalString(args, 'table')
       const signal = executionSignal(exec)
-      if (table !== undefined) {
-        const columns = await adapter.describeTable(table, signal)
-        // 查不到列时把全部表名一并带上，方便确认是表名写错还是真没权限。
-        const tables = columns.length === 0 ? await adapter.listTables(signal) : []
-        return { connection: name, table, columns, tables, tableMissing: columns.length === 0 }
+      try {
+        if (table !== undefined) {
+          const columns = await adapter.describeTable(table, signal)
+          // 查不到列时把全部表名一并带上，方便确认是表名写错还是真没权限。
+          const tables = columns.length === 0 ? await adapter.listTables(signal) : []
+          return { connection: name, table, columns, tables, tableMissing: columns.length === 0 }
+        }
+        const tables = await adapter.listTables(signal)
+        return { connection: name, tables, columns: [] }
+      } catch (error) {
+        // 同 sql_query：连接异常用返回文案交代，不抛出、不重试。
+        signal?.throwIfAborted()
+        if (!isBrokenFailure(error)) throw error
+        return { connection: name, table: table ?? '', tables: [], columns: [], failed: true, report: connectionBrokenReport('sql_schema', name, error) }
       }
-      const tables = await adapter.listTables(signal)
-      return { connection: name, tables, columns: [] }
     },
     timeoutMs: 30000,
   })
@@ -458,6 +563,7 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
       schema: statsSchema,
       render: (_args, value) => {
         const rec = asRecord(value)
+        if (typeof rec.report === 'string' && rec.report !== '') return [{ type: 'text', text: rec.report }]
         const tables = Array.isArray(rec.tables) ? rec.tables : []
         // 计数用 tableCount（execute 里已剔除失败项），不能拿 tables.length 当表数。
         const count = typeof rec.tableCount === 'number' ? rec.tableCount : tables.length
@@ -494,6 +600,11 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
           sizeBytes = await databaseSize(adapter, engine, connection.database, signal)
         } catch (error) {
           signal?.throwIfAborted()
+          // 连接断了就不再往下打（下面还要查表清单，那不又是一轮重试？）。
+          // 立刻把「连接异常，请勿重试」作为本次调用的结果交出去。
+          if (isBrokenFailure(error)) {
+            return { connection: name, engine, tableCount: 0, tables: [], tablesError: '', sizeBytes: -1, sizeError: '', failed: true, report: connectionBrokenReport('sql_stats', name, error) }
+          }
           sizeBytes = -1
           sizeError = error instanceof Error ? error.message : String(error)
         }
@@ -514,6 +625,9 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
           }
         } catch (error) {
           signal?.throwIfAborted()
+          if (isBrokenFailure(error)) {
+            return { connection: name, engine, tableCount: 0, tables: [], tablesError: '', sizeBytes, sizeError, failed: true, report: connectionBrokenReport('sql_stats', name, error) }
+          }
           tablesError = error instanceof Error ? error.message : String(error)
         }
       } else {
@@ -524,6 +638,10 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
             tables.push({ name: table, rowCount: Number(result.rows[0]?.[0] ?? 0) })
           } catch (error) {
             signal?.throwIfAborted()
+            // 逐表计数时连接断了：**不要再逐表重试**（SQLite 走这条分支，错误是文件级/IO 级）。
+            if (isBrokenFailure(error)) {
+              return { connection: name, engine, tableCount: 0, tables: [], tablesError: '', sizeBytes, sizeError, failed: true, report: connectionBrokenReport('sql_stats', name, error) }
+            }
             tables.push({ name: table, error: error instanceof Error ? error.message : String(error) })
           }
         }
@@ -536,7 +654,16 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
   const sqlHealth = defineTool({
     name: 'sql_health',
     description: '逐连接做连通性测试（SELECT 1），返回每个连接通不通。只探在 activeEnv 下可见的连接。',
-    parameters: {},
+    parameters: {
+      reset: {
+        type: 'boolean',
+        description: '显式重连，重建连接池。',
+      },
+      connection: {
+        type: 'string',
+        description: '指定重连连接',
+      },
+    },
     output: {
       schema: healthSchema,
       render: (_args, value) => {
@@ -547,15 +674,52 @@ export function buildSqlTools(loadConfig: () => SqlSettings): { tools: SqlToolDe
           return [{ type: 'text', text: 'dsh-sql 探活：activeEnv 下没有可见的连接。用 sql_settings 看配置，在插件设置页添加连接。' }]
         }
         const lines = ['dsh-sql 探活' + (bad.length === 0 ? '：全部连接正常。' : '：' + bad.length + ' / ' + connections.length + ' 个连接异常。')]
+        const brokenNames: string[] = []
         for (const item of connections) {
           const c = asRecord(item)
-          lines.push('- ' + c.name + (c.ok === true ? ' ✅' : ' ❌ ' + String(c.error ?? '')))
+          if (c.broken === true) brokenNames.push(String(c.name))
+          const tag = c.reconnected === true ? '（已重连）' : ''
+          lines.push('- ' + c.name + tag + (c.ok === true ? ' ✅' : ' ❌ ' + String(c.error ?? '')))
+        }
+        // broken 的连接**不会**被普通探活唤醒（不自动重连）——这里给出显式重连的入口。
+        if (brokenNames.length > 0) {
+          lines.push('')
+          lines.push('⛔ 以下连接已被标记为不可用，插件不会自动重连，也不会重试：' + brokenNames.join('、'))
+          lines.push('   确认数据库服务与网络已恢复后，可调用 sql_health 并传 reset=true 显式重连一次')
+          lines.push('   （只重连一次，仍失败请检查连接配置）。')
         }
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },
-    async execute(_args, exec) {
-      const connections = await pingAllConnections(executionSignal(exec))
+    async execute(args, exec) {
+      const signal = executionSignal(exec)
+      const reset = args.reset === true
+      const only = optionalString(args, 'connection')
+
+      if (reset) {
+        // 显式重连路径：不经过 adapterFor（那个在 broken 时会抛），直接重建 + 探活一次。
+        const cfg = loadConfig()
+        const available = splitConnectionsByEnv(cfg)
+        const names = only !== undefined ? [only] : Object.keys(available)
+        if (names.length === 0) {
+          return { ok: true, reconnected: true, connections: [], message: 'activeEnv 下没有可见的连接，无需重连。' }
+        }
+        const results = await Promise.all(names.map(async (name) => {
+          try {
+            const result = await forceReconnect(name, signal)
+            const entry: Record<string, unknown> = { name: result.name, ok: result.ok, error: result.error, reconnected: true }
+            return entry
+          } catch (error) {
+            signal?.throwIfAborted()
+            // 名字不存在、配置缺失这类错误 → 该连接重连失败，但不影响其它连接。
+            return { name, ok: false, error: error instanceof Error ? error.message : String(error), reconnected: false }
+          }
+        }))
+        const bad = results.filter((item) => item.ok !== true)
+        return { ok: bad.length === 0, reconnected: true, connections: results }
+      }
+
+      const connections = await pingAllConnections(signal)
       const bad = connections.filter((c) => c.ok !== true)
       return { ok: bad.length === 0, connections }
     },

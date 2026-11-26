@@ -24,9 +24,114 @@ export interface ColumnInfo {
   primaryKey: boolean
 }
 
+/**
+ * 连接层的健康状态。
+ *
+ * `broken` = 这个适配器的底层连接已经断了（服务端关停、网络中断、被中间设备掐断……）。
+ * 一旦置上就**不会自己恢复**：插件不自动重连、不自动重试，也不在下次调用时重建连接池。
+ * 只有连接定义变了（`tools.ts` 的指纹失效）或插件重启才会换上新池。
+ */
+export interface ConnectionHealth {
+  state: 'ok' | 'broken'
+  /** broken 的原因（驱动原始错误的 message，可能为空串）。 */
+  reason: string
+  /** broken 的时刻（ISO 字符串）。 */
+  at: string
+}
+
+const HEALTHY: ConnectionHealth = { state: 'ok', reason: '', at: '' }
+
+/**
+ * 判断一个错误是否属于「连接已经不可用」。
+ *
+ * **只认明确的连接类信号，不拿 message 做子串匹配** —— 跟 `isAbortError` 同一个道理：
+ * `column "connection" does not exist` 这种普通 SQL 错误要是被误判成断连，
+ * 会把一个只是写错列名的连接永久标死，用户改 SQL 也救不回来。
+ */
+export function isConnectionError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false
+  const code = (error as { code?: unknown }).code
+  if (typeof code !== 'string') return false
+  // Node 网络层
+  if (code === 'ECONNRESET' || code === 'ECONNREFUSED' || code === 'ECONNABORTED') return true
+  if (code === 'ETIMEDOUT' || code === 'EPIPE' || code === 'ENOTFOUND' || code === 'EHOSTUNREACH') return true
+  // PostgreSQL：08 类是连接异常；57P01/57P02/57P03 是服务端关停/崩溃恢复/正在启动
+  if (/^08/.test(code)) return true
+  if (code === '57P01' || code === '57P02' || code === '57P03') return true
+  // mysql2
+  if (code === 'PROTOCOL_CONNECTION_LOST' || code === 'PROTOCOL_SEQUENCE_TIMEOUT' || code === 'PROTOCOL_ENQUEUE_HANDSHAKE_TWICE') return true
+  if (code === 'ER_SERVER_SHUTDOWN' || code === 'ER_CONNECTION_COUNT_ERROR' || code === 'HANDSHAKE_SSL_ERROR') return true
+  return false
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error && error.message !== '') {
+    const code = (error as { code?: unknown }).code
+    return typeof code === 'string' && code !== '' ? error.message + '（code=' + code + '）' : error.message
+  }
+  return String(error)
+}
+
+/**
+ * 连接状态的可变持有者：mysql / postgres 两个适配器共用。
+ *
+ * sqlite 不接 error 事件（node:sqlite 是同步 API，错误直接从调用里抛），
+ * 但它同样实现 `health()` —— 统一接口，工具层不必分支。
+ */
+class HealthTracker {
+  private current: ConnectionHealth = HEALTHY
+  get(): ConnectionHealth {
+    return this.current
+  }
+  markBroken(error: unknown): void {
+    // 第一条原因最有价值（后续往往只是「已关闭」的连带错误），保留它。
+    if (this.current.state === 'broken') return
+    this.current = { state: 'broken', reason: errorMessage(error), at: new Date().toISOString() }
+  }
+  markOk(): void {
+    this.current = HEALTHY
+  }
+}
+
+/**
+ * 统一的「连接异常」错误。
+ *
+ * `message` 就是给模型看的那段文案：**必须同时说清「这是连接异常」和「不要重试」**，
+ * 否则模型会自己脑补一轮重试，正好撞上用户明确不要的行为。
+ */
+export class ConnectionBrokenError extends Error {
+  readonly connection: string
+  readonly reason: string
+  readonly at: string
+  constructor(connection: string, reason: string, at: string) {
+    super(
+      '数据库连接异常，本次调用失败。\n'
+      + '连接：' + connection + '\n'
+      + '原因：' + (reason !== '' ? reason : '连接已断开（驱动未给出具体原因）') + '\n'
+      + '时间：' + (at !== '' ? at : '未知') + '\n'
+      + '状态：该连接已被标记为不可用，数据库服务可能已停止，不要重试工具！\n'
+      + '   请先让用户确认数据库与网络恢复，再发起 sql_health（reset=true，connection=该连接）触发一次重建。',
+    )
+    this.name = 'ConnectionBrokenError'
+    this.connection = connection
+    this.reason = reason
+    this.at = at
+  }
+}
+
 /** 统一适配器接口。 */
 export interface DatabaseAdapter {
   engine: 'sqlite' | 'mysql' | 'postgres'
+  /** 当前连接健康状态；broken 之后适配器不可再用（工具层据此拒绝调用，不重连）。 */
+  health(): ConnectionHealth
+  /**
+   * 清掉 broken 标记，回到 ok。
+   *
+   * **只给「显式重连」用**（`sql_health` 的 `reset` 参数）：调用方先关掉旧适配器、
+   * 再建一个新的并调它。插件自己**不会**在任何自动路径上调这个方法 ——
+   * 不然就成了「偷偷重连」，跟「数据库挂了就别自动连」的要求相悖。
+   */
+  markHealthy(): void
   listTables(signal?: AbortSignal): Promise<string[]>
   describeTable(table: string, signal?: AbortSignal): Promise<ColumnInfo[]>
   query(sql: string, limit?: number, signal?: AbortSignal): Promise<QueryResult>
@@ -197,10 +302,17 @@ function streamPostgresQuery(client: pg.PoolClient, sql: string, limit: number, 
 /** SQLite 适配器（node:sqlite，零依赖）。 */
 class SqliteAdapter implements DatabaseAdapter {
   engine = 'sqlite' as const
+  private readonly healthTracker = new HealthTracker()
   private db: DatabaseSync
   constructor(file: string) {
     this.db = new DatabaseSync(file === ':memory:' ? ':memory:' : file)
     this.db.exec('PRAGMA busy_timeout = 5000')
+  }
+  health(): ConnectionHealth {
+    return this.healthTracker.get()
+  }
+  markHealthy(): void {
+    this.healthTracker.markOk()
   }
   async listTables(signal?: AbortSignal) {
     signal?.throwIfAborted()
@@ -286,6 +398,7 @@ function driverPort(port: string | undefined): number | undefined {
 class MysqlAdapter implements DatabaseAdapter {
   engine = 'mysql' as const
   private pool: mysql.Pool
+  private readonly healthTracker = new HealthTracker()
   constructor(connection: SqlConnectionConfig) {
     this.pool = mysql.createPool({
       host: connection.host,
@@ -296,6 +409,18 @@ class MysqlAdapter implements DatabaseAdapter {
       connectionLimit: 5,
       enableKeepAlive: true,
     })
+    // mysql2 的池也会把空闲连接的断连错误 emit 出来；不接就冒到进程（同 PG 那次崩溃）。
+    // 只登记状态，不重连、不重试。
+    ;(this.pool as unknown as { on(event: 'error', listener: (error: unknown) => void): void })
+      .on('error', (error: unknown) => {
+        if (isConnectionError(error)) this.healthTracker.markBroken(error)
+      })
+  }
+  health(): ConnectionHealth {
+    return this.healthTracker.get()
+  }
+  markHealthy(): void {
+    this.healthTracker.markOk()
   }
   private async withSignalConnection<T>(signal: AbortSignal | undefined, work: (connection: mysql.PoolConnection, discard: () => void) => Promise<T>): Promise<T> {
     signal?.throwIfAborted()
@@ -317,6 +442,11 @@ class MysqlAdapter implements DatabaseAdapter {
     try {
       signal?.throwIfAborted()
       return await Promise.race([work(connection, discard), aborted])
+    } catch (error) {
+      // 连接断了 → 登记 broken（工具层下一次调用据此直接报错，不重连）。
+      // 调用方仍然拿到这个错误（各工具统一渲染成「连接异常，请勿重试」）。
+      if (isConnectionError(error)) this.healthTracker.markBroken(error)
+      throw error
     } finally {
       signal?.removeEventListener('abort', onAbort)
       if (!destroyed) connection.release()
@@ -324,7 +454,10 @@ class MysqlAdapter implements DatabaseAdapter {
   }
   private async queryRows(sql: string, signal?: AbortSignal): Promise<any> {
     if (signal === undefined) {
-      return await this.pool.query(sql).catch((error: unknown) => { throw describeDriverError(error) })
+      return await this.pool.query(sql).catch((error: unknown) => {
+        if (isConnectionError(error)) this.healthTracker.markBroken(error)
+        throw describeDriverError(error)
+      })
     }
     return await this.withSignalConnection(signal, async (connection) => await connection.query(sql))
   }
@@ -368,6 +501,7 @@ class MysqlAdapter implements DatabaseAdapter {
 class PostgresAdapter implements DatabaseAdapter {
   engine = 'postgres' as const
   private pool: pg.Pool
+  private readonly healthTracker = new HealthTracker()
   constructor(connection: SqlConnectionConfig) {
     this.pool = new pg.Pool({
       host: connection.host,
@@ -377,11 +511,37 @@ class PostgresAdapter implements DatabaseAdapter {
       database: connection.database,
       max: 5,
     })
+    // ⚠ **这一行是防宿主崩溃的关键**。
+    //
+    //   pg 的 Client 在连接出错时会 `this.emit('error', err)`（见 pg/lib/client.js 的
+    //   `_handleErrorWhileConnecting` / `_handleErrorEvent`）。Node 里没人监听的 'error'
+    //   事件会被当成未捕获异常直接抛到进程 —— 也就是那张崩溃截图：
+    //
+    //     dsh: fatal uncaught exception: Error: Connection terminated unexpectedly
+    //       at Connection.<anonymous> (pg/lib/connection.js:73)
+    //
+    //   空闲连接被服务端/中间设备断开时正好走这条路：那一刻没有任何查询在等它，
+    //   于是没人接这个 error，整个 dsh host 陪葬。
+    //
+    //   挂上监听后，这个错误只是被「收下」并登记成 broken，进程不受影响。
+    //   顺带好处：池级 error 被消费后，pg 不会再把这条死连接放回可用列表。
+    this.pool.on('error', (error: Error) => {
+      this.healthTracker.markBroken(error)
+    })
+  }
+  health(): ConnectionHealth {
+    return this.healthTracker.get()
+  }
+  markHealthy(): void {
+    this.healthTracker.markOk()
   }
   private async withSignalClient<T>(signal: AbortSignal | undefined, work: (client: pg.PoolClient, discard: () => void) => Promise<T>): Promise<T> {
     signal?.throwIfAborted()
     // 取连接是连接失败的爆发点（host/端口/凭据错都在这里），转一手免得 message 为空。
-    const client = await this.pool.connect().catch((error: unknown) => { throw describeDriverError(error) })
+    const client = await this.pool.connect().catch((error: unknown) => {
+      if (isConnectionError(error)) this.healthTracker.markBroken(error)
+      throw describeDriverError(error)
+    })
     let destroyed = false
     let rejectAbort: (reason: unknown) => void = () => {}
     const aborted = new Promise<never>((_resolve, reject) => { rejectAbort = reject })
@@ -390,6 +550,12 @@ class PostgresAdapter implements DatabaseAdapter {
       destroyed = true
       client.release(true)
     }
+    // 插件自己手里的这条 client 也要接住 error：它断了时 pg 同样会 emit（见池上那段注释），
+    // 而这个 client 已经不在池的监听范围内。只登记状态，不重连。
+    const onClientError = (error: unknown): void => {
+      this.healthTracker.markBroken(error)
+    }
+    client.on('error', onClientError)
     const onAbort = (): void => {
       discard()
       rejectAbort(abortReason(signal!))
@@ -398,8 +564,13 @@ class PostgresAdapter implements DatabaseAdapter {
     try {
       signal?.throwIfAborted()
       return await Promise.race([work(client, discard), aborted])
+    } catch (error) {
+      // 连接断了 → 登记 broken；调用方仍拿到这个错误（工具层渲染成「连接异常，请勿重试」）。
+      if (isConnectionError(error)) this.healthTracker.markBroken(error)
+      throw error
     } finally {
       signal?.removeEventListener('abort', onAbort)
+      client.removeListener('error', onClientError)
       if (!destroyed) client.release()
     }
   }
@@ -408,7 +579,10 @@ class PostgresAdapter implements DatabaseAdapter {
       return values === undefined ? await client.query(query) : await client.query(query, values)
     }
     if (signal === undefined) {
-      return await run(this.pool).catch((error: unknown) => { throw describeDriverError(error) })
+      return await run(this.pool).catch((error: unknown) => {
+        if (isConnectionError(error)) this.healthTracker.markBroken(error)
+        throw describeDriverError(error)
+      })
     }
     return await this.withSignalClient(signal, run)
   }
